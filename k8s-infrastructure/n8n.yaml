@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: n8n
+  template:
+    metadata:
+      labels:
+        app: n8n
+    spec:
+      containers:
+      - name: n8n
+        image: docker.n8n.io/n8nio/n8n:latest
+        ports:
+        - containerPort: 5678
+        env:
+        # 1. Tell n8n to turn on OpenTelemetry
+        - name: N8N_OTEL_ENABLED
+          value: "true"
+        # 2. Point it to your OTel Collector service (HTTP port 4318)
+        - name: N8N_OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://cluster-collector-collector.default.svc.cluster.local:4318"
+        # 3. Ensure it traces execution data
+        - name: N8N_EXECUTIONS_DATA_ENV
+          value: "all"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n-service
+  namespace: default
+spec:
+  selector:
+    app: n8n
+  ports:
+  - port: 5678
+    targetPort: 5678

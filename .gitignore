@@ -1,0 +1,28 @@
+# Claude Code local settings (machine-specific permission overrides)
+.claude/settings.local.json
+
+# Java / Spring Boot (Maven & Gradle)
+target/
+build/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS cruft
+.DS_Store
+
+# Secrets / credentials — never commit these
+*.pem
+*.key
+*-key.json
+*credentials*.json
+.env
+.env.*
+kubeconfig*
