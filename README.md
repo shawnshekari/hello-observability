@@ -121,3 +121,20 @@ helm install camunda-poc camunda/camunda-platform \
 ```
 (If Zeebe pods get stuck in a CrashLoop or refuse to become Ready due to split-brain Raft state from a previous deployment, wipe the state by deleting the PVCs: kubectl delete pvc --all -n camunda and reinstall).
 
+## ⚡ Quick Start: Up/Down Scripts
+
+The manual steps above are automated in `scripts/`, useful for spinning the PoC up before a demo
+and tearing it down afterward so nothing keeps billing while it's idle:
+
+```bash
+./scripts/up.sh    # cert-manager -> OTel Operator -> OTel Collector -> n8n -> Camunda/Zeebe
+./scripts/down.sh  # uninstalls all of the above and deletes Zeebe's PVC (the billed persistent disk)
+```
+
+Both are idempotent and safe to re-run. `down.sh` deliberately leaves the GKE Autopilot cluster
+itself and the `otel-collector-gsa` IAM setup in place, since Autopilot has no idle cluster fee and
+keeping them makes the next `up.sh` faster; pass `./scripts/down.sh --delete-cluster` if you want the
+cluster gone too for absolute zero spend. `up.sh` also re-binds the OTel Collector's ServiceAccount
+to Workload Identity on every run, since the OTel Operator regenerates that ServiceAccount whenever
+its manifest is reapplied — see `ISSUE.md` #1 for why that matters.
+
