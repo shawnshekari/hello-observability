@@ -1,0 +1,26 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: hello-observability-app
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      otlp:
+        enabled: true
+        naming:
+          convention: full
+        properties:
+          otel.service.name: ${spring.application.name}
+
+camunda:
+  client:
+    mode: simple
+    zeebe:
+      gateway-address: ${ZEEBE_GATEWAY_ADDRESS:camunda-poc-zeebe-gateway.camunda.svc.cluster.local:26662}

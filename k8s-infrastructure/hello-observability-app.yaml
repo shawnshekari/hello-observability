@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-observability-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-observability-app
+  template:
+    metadata:
+      labels:
+        app: hello-observability-app
+    spec:
+      containers:
+      - name: hello-observability-app
+        image: hello-observability-app:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://cluster-collector-collector.default.svc.cluster.local:4318"
+        - name: OTEL_SERVICE_NAME
+          value: "hello-observability-app"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-observability-app
+  namespace: default
+spec:
+  selector:
+    app: hello-observability-app
+  ports:
+  - port: 80
+    targetPort: 8080
