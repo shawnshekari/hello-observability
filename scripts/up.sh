@@ -20,6 +20,12 @@ CLUSTER_NAME="hello-observability-cluster"
 COLLECTOR_KSA="cluster-collector-collector"
 COLLECTOR_GSA="otel-collector-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Namespace configuration
+# - observability: OTel Collector (telemetry aggregation)
+# - apps: n8n, Camunda 8, Spring Boot (application workloads)
+NS_OBSERVABILITY="observability"
+NS_APPS="apps"
+
 # Image configuration for Spring Boot app
 DOCKER_IMAGE="gcr.io/${PROJECT_ID}/hello-observability-app"
 
@@ -88,14 +94,15 @@ kubectl rollout status deployment/opentelemetry-operator-controller-manager \
 # ============================================================================
 # The OTel Collector is the central hub for telemetry data. It:
 # - Receives OTLP traces from n8n and Spring Boot
-# - Scrapes Prometheus metrics from Zeebe and Spring Boot
+# - Scrapes Prometheus metrics from Zeebe, Operate, and Spring Boot
 # - Exports everything to Google Cloud (Trace + Monitoring)
 #
-# The collector runs in the 'default' namespace and uses Workload Identity
+# The collector runs in the 'observability' namespace and uses Workload Identity
 # to authenticate with GCP APIs.
 echo "==> Deploying the OTel Collector"
+kubectl create namespace "${NS_OBSERVABILITY}" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/otel-collector.yaml"
-kubectl rollout status deployment/${COLLECTOR_KSA} -n default --timeout=120s
+kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
 
 # ============================================================================
 # Step 5: Bind OTel Collector to GCP Service Account (Workload Identity)
@@ -107,13 +114,13 @@ kubectl rollout status deployment/${COLLECTOR_KSA} -n default --timeout=120s
 # This allows the collector pod to impersonate the GSA and export
 # traces/metrics to GCP without API keys.
 echo "==> Re-binding collector ServiceAccount to ${COLLECTOR_GSA} (Workload Identity)"
-kubectl annotate serviceaccount "${COLLECTOR_KSA}" -n default \
+kubectl annotate serviceaccount "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} \
   iam.gke.io/gcp-service-account="${COLLECTOR_GSA}" --overwrite
 
 # Restart collector pod to pick up the new identity binding
 echo "==> Restarting collector pod to pick up the identity binding"
-kubectl delete pod -n default -l app.kubernetes.io/name=${COLLECTOR_KSA} --ignore-not-found
-kubectl rollout status deployment/${COLLECTOR_KSA} -n default --timeout=120s
+kubectl delete pod -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=${COLLECTOR_KSA} --ignore-not-found
+kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
 
 # ============================================================================
 # Step 6: Deploy n8n (workflow automation)
@@ -126,11 +133,12 @@ kubectl rollout status deployment/${COLLECTOR_KSA} -n default --timeout=120s
 # n8n is configured with OpenTelemetry enabled, so it exports traces
 # to our OTel Collector automatically.
 echo "==> Deploying n8n"
+kubectl create namespace "${NS_APPS}" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/n8n.yaml"
 
 # Wait for n8n to be ready before importing workflow
 echo "==> Waiting for n8n to be ready..."
-kubectl rollout status deployment/n8n -n default --timeout=120s
+kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
 
 # ============================================================================
 # Step 7: Deploy Camunda 8 (Zeebe workflow engine)
@@ -141,12 +149,12 @@ kubectl rollout status deployment/n8n -n default --timeout=120s
 # - Exports metrics to OTel Collector (scraped via Prometheus)
 #
 # We use Helm chart 11.12.3 (Camunda 8.6.x) to avoid kernel issues on
-# Autopilot. Only Zeebe + Gateway are deployed (no UI, no Elasticsearch).
+# Autopilot. Only Zeebe + Gateway + Operate are deployed (no Elasticsearch).
 echo "==> Deploying Camunda 8 (Zeebe)"
 helm repo add camunda https://helm.camunda.io >/dev/null
 helm repo update >/dev/null
 helm upgrade --install camunda-poc camunda/camunda-platform \
-  --namespace camunda \
+  --namespace ${NS_APPS} \
   --create-namespace \
   --version 11.12.3 \
   -f "${REPO_ROOT}/helm-values/camunda-values.yaml" \
@@ -154,8 +162,8 @@ helm upgrade --install camunda-poc camunda/camunda-platform \
 
 # Wait for Zeebe to be ready
 echo "==> Waiting for Zeebe to be ready..."
-kubectl rollout status statefulset/camunda-poc-zeebe -n camunda --timeout=120s
-kubectl rollout status deployment/camunda-poc-zeebe-gateway -n camunda --timeout=120s
+kubectl rollout status statefulset/camunda-poc-zeebe -n ${NS_APPS} --timeout=120s
+kubectl rollout status deployment/camunda-poc-zeebe-gateway -n ${NS_APPS} --timeout=120s
 
 # ============================================================================
 # Step 8: Deploy Spring Boot App
@@ -170,30 +178,30 @@ kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/hello-observability-app.yaml"
 
 # Wait for Spring Boot app to be ready
 echo "==> Waiting for Spring Boot app to be ready..."
-kubectl rollout status deployment/hello-observability-app -n default --timeout=120s
+kubectl rollout status deployment/hello-observability-app -n ${NS_APPS} --timeout=120s
 
 # ============================================================================
 # Summary
 # ============================================================================
 echo "==> Done. Current pods:"
-kubectl get pods -n default
-kubectl get pods -n camunda
+kubectl get pods -n ${NS_OBSERVABILITY}
+kubectl get pods -n ${NS_APPS}
 
-cat <<'EOF'
+cat <<EOF
 
 ==> Deployment complete! Verify everything is working:
 
 1. Check OTel Collector logs for successful exports:
-   kubectl logs -n default -l app.kubernetes.io/name=cluster-collector-collector --tail=50
+   kubectl logs -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=cluster-collector-collector --tail=50
 
 2. Test n8n webhook (port-forward first):
-   kubectl port-forward svc/n8n-service 5678:5678
+   kubectl port-forward svc/n8n-service 5678:5678 -n ${NS_APPS}
    curl -X POST http://localhost:5678/webhook/order-validation \
      -H "Content-Type: application/json" \
      -d '{"orderId": "test-1", "itemName": "Widget", "quantity": 2}'
 
 3. Test Spring Boot app (port-forward first):
-   kubectl port-forward svc/hello-observability-app 8080:80
+   kubectl port-forward svc/hello-observability-app 8080:80 -n ${NS_APPS}
    curl -X POST http://localhost:8080/orders \
      -H "Content-Type: application/json" \
      -d '{"orderId": "test-1", "itemName": "Widget", "quantity": 2}'
@@ -206,7 +214,7 @@ cat <<'EOF'
 
 If Zeebe is stuck in CrashLoop from stale Raft state (e.g. after a partial
 teardown), wipe it and reinstall:
-   kubectl delete pvc --all -n camunda
-   helm uninstall camunda-poc -n camunda
+   kubectl delete pvc --all -n ${NS_APPS}
+   helm uninstall camunda-poc -n ${NS_APPS}
    ./scripts/up.sh
 EOF

@@ -13,8 +13,8 @@
 #   gcloud iam service-accounts add-iam-policy-binding \
 #     otel-collector-gsa@<PROJECT_ID>.iam.gserviceaccount.com \
 #     --role="roles/iam.workloadIdentityUser" \
-#     --member="serviceAccount:<PROJECT_ID>.svc.id.goog[default/cluster-collector-collector]"
-#   kubectl annotate serviceaccount cluster-collector-collector -n default \
+#     --member="serviceAccount:<PROJECT_ID>.svc.id.goog[observability/cluster-collector-collector]"
+#   kubectl annotate serviceaccount cluster-collector-collector -n observability \
 #     iam.gke.io/gcp-service-account=otel-collector-gsa@<PROJECT_ID>.iam.gserviceaccount.com
 #
 # See ISSUE.md #1 for the full incident writeup. The KSA name above (`cluster-collector-collector`)
@@ -23,7 +23,7 @@ apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
 metadata:
   name: cluster-collector
-  namespace: default
+  namespace: observability
 spec:
   mode: deployment
   image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest
@@ -35,7 +35,7 @@ spec:
             endpoint: 0.0.0.0:4317
           http:
             endpoint: 0.0.0.0:4318
-      # Scrape metrics from all components
+      # Scrape metrics from all components in apps namespace
       prometheus:
         config:
           scrape_configs:
@@ -44,21 +44,21 @@ spec:
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                - targets: ['camunda-poc-zeebe-0.camunda-poc-zeebe.camunda.svc.cluster.local:9600']
+                - targets: ['camunda-poc-zeebe-0.camunda-poc-zeebe.apps.svc.cluster.local:9600']
 
             # Camunda Operate metrics (workflow instance tracking)
             - job_name: 'camunda-operate'
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                - targets: ['camunda-poc-operate-0.camunda-poc-operate.camunda.svc.cluster.local:8080']
+                - targets: ['camunda-poc-operate-0.camunda-poc-operate.apps.svc.cluster.local:8080']
 
             # Spring Boot app metrics (custom business metrics)
             - job_name: 'hello-observability-app'
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                - targets: ['hello-observability-app.default.svc.cluster.local:8080']
+                - targets: ['hello-observability-app.apps.svc.cluster.local:8080']
 
     exporters:
       googlecloud:

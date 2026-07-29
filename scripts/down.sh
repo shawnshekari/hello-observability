@@ -23,6 +23,10 @@ PROJECT_ID="hellootelworld"
 REGION="us-central1"
 CLUSTER_NAME="hello-observability-cluster"
 
+# Namespace configuration
+NS_OBSERVABILITY="observability"
+NS_APPS="apps"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DELETE_CLUSTER=false
 [[ "${1:-}" == "--delete-cluster" ]] && DELETE_CLUSTER=true
@@ -46,15 +50,11 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
 # services depend on it for workflow execution. The PVCs are deleted
 # separately to release the billed persistent disk (32Gi).
 echo "==> Uninstalling Camunda 8 (Zeebe)"
-helm uninstall camunda-poc -n camunda 2>/dev/null || echo "    (release not found, skipping)"
+helm uninstall camunda-poc -n ${NS_APPS} 2>/dev/null || echo "    (release not found, skipping)"
 
 # Delete PersistentVolumeClaims to free up disk space (billed resource!)
 echo "==> Deleting Zeebe PersistentVolumeClaims (this releases the billed persistent disk)"
-kubectl delete pvc --all -n camunda --ignore-not-found
-
-# Delete the camunda namespace to clean up resources
-echo "==> Deleting camunda namespace"
-kubectl delete namespace camunda --ignore-not-found --timeout=120s
+kubectl delete pvc --all -n ${NS_APPS} --ignore-not-found
 
 # ============================================================================
 # Step 2: Delete n8n
@@ -98,7 +98,14 @@ helm uninstall cert-manager -n cert-manager 2>/dev/null || echo "    (release no
 kubectl delete namespace cert-manager --ignore-not-found --timeout=120s
 
 # ============================================================================
-# Step 7: Delete GKE cluster (optional)
+# Step 7: Delete namespaces
+# ============================================================================
+echo "==> Deleting namespaces"
+kubectl delete namespace ${NS_APPS} --ignore-not-found --timeout=120s
+kubectl delete namespace ${NS_OBSERVABILITY} --ignore-not-found --timeout=120s
+
+# ============================================================================
+# Step 8: Delete GKE cluster (optional)
 # ============================================================================
 # GKE Autopilot has no cluster management fee, so we keep it by default.
 # Pass --delete-cluster to remove it for true zero spend.
