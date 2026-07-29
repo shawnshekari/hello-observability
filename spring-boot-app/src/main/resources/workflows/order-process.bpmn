@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_1"
+                  targetNamespace="http://bpmn.io/schema/bpmn">
+
+  <bpmn:process id="order-process" name="Order Process" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_1" name="Order Received">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="ValidateOrder" />
+
+    <bpmn:serviceTask id="ValidateOrder" name="Validate Order"
+                      zeebe:type="rest"
+                      zeebe:httpMethod="POST"
+                      zeebe:httpUrl="http://n8n-service.default.svc.cluster.local:5678/webhook/order-validation"
+                      zeebe:responseVariable="validationResult">
+      <bpmn:extensionElements>
+        <zeebe:ioMapping>
+          <zeebe:input source="orderId" target="orderId" />
+          <zeebe:input source="itemName" target="itemName" />
+          <zeebe:input source="quantity" target="quantity" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Error</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="ValidateOrder" targetRef="CompleteOrder" />
+
+    <bpmn:endEvent id="CompleteOrder" name="Order Completed">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:intermediateCatchEvent id="ValidationFailed" name="Validation Failed">
+      <bpmn:incoming>Flow_Error</bpmn:incoming>
+      <bpmn:outgoing>Flow_End</bpmn:outgoing>
+      <bpmn:boundaryEvent id="ErrorBoundary" name="Validation Error">
+        <bpmn:errorEventDefinition errorRef="ValidationError" />
+      </bpmn:boundaryEvent>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:endEvent id="EndEvent_1" name="Order Failed">
+      <bpmn:incoming>Flow_End</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="Flow_Error" sourceRef="ValidateOrder" targetRef="ValidationFailed" />
+    <bpmn:sequenceFlow id="Flow_End" sourceRef="ValidationFailed" targetRef="EndEvent_1" />
+  </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="order-process">
+      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
+        <dc:Bounds x="180" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ValidateOrder_di" bpmnElement="ValidateOrder">
+        <dc:Bounds x="300" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="CompleteOrder_di" bpmnElement="CompleteOrder">
+        <dc:Bounds x="480" y="102" width="36" height="36" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

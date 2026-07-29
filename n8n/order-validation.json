@@ -1,0 +1,123 @@
+{
+  "name": "Order Validation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "order-validation",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "order-validation-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.quantity }}",
+              "operation": "largerEqual",
+              "value2": "1"
+            }
+          ]
+        }
+      },
+      "name": "Check Quantity",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "responseMode": "responseJson",
+        "options": {}
+      },
+      "name": "Valid Order",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [650, 200],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "valid",
+              "name": "valid",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "message",
+              "name": "message",
+              "value": "Order validated successfully",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "parameters": {
+        "responseMode": "responseJson",
+        "options": {}
+      },
+      "name": "Invalid Order",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [650, 400],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "valid",
+              "name": "valid",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "message",
+              "name": "message",
+              "value": "Order quantity must be at least 1",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Check Quantity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Quantity": {
+      "main": [
+        [
+          {
+            "node": "Valid Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "versionId": "1"
+}
