@@ -140,6 +140,17 @@ kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/n8n.yaml"
 echo "==> Waiting for n8n to be ready..."
 kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
 
+# Import n8n workflow
+echo "==> Importing n8n order validation workflow"
+N8N_POD=$(kubectl get pods -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].metadata.name}')
+N8N_WORKFLOW=$(cat "${REPO_ROOT}/n8n/order-validation.json")
+kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "echo '${N8N_WORKFLOW}' | curl -s -X POST http://localhost:5678/api/v1/workflows -H 'Content-Type: application/json' -d @-"
+
+# Activate the workflow
+WORKFLOW_ID=$(kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s http://localhost:5678/api/v1/workflows | jq -r '.workflows[] | select(.name==\"Order Validation\") | .id'")
+kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s -X PUT http://localhost:5678/api/v1/workflows/${WORKFLOW_ID}/activate"
+echo "    n8n workflow imported and activated (id: ${WORKFLOW_ID})"
+
 # ============================================================================
 # Step 7: Deploy Camunda 8 (Zeebe workflow engine)
 # ============================================================================
@@ -166,7 +177,20 @@ kubectl rollout status statefulset/camunda-poc-zeebe -n ${NS_APPS} --timeout=120
 kubectl rollout status deployment/camunda-poc-zeebe-gateway -n ${NS_APPS} --timeout=120s
 
 # ============================================================================
-# Step 8: Deploy Spring Boot App
+# Step 8: Build and push Spring Boot image
+# ============================================================================
+# Build the Spring Boot app container image and push it to GCR so the
+# cluster can pull it. Uses Docker Buildx for multi-arch if available.
+echo "==> Building Spring Boot image"
+cd "${REPO_ROOT}/spring-boot-app"
+docker build -t "${DOCKER_IMAGE}" .
+
+echo "==> Pushing Spring Boot image to GCR"
+docker push "${DOCKER_IMAGE}"
+cd "${REPO_ROOT}"
+
+# ============================================================================
+# Step 9: Deploy Spring Boot App
 # ============================================================================
 # The Spring Boot app is our order service. It:
 # - Exposes REST API for creating orders

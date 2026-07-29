@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: hello-observability-app
-        image: hello-observability-app:latest
+        image: gcr.io/hellootelworld/hello-observability-app:latest
         ports:
         - containerPort: 8080
         env:
