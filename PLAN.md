@@ -21,13 +21,20 @@ Spring Boot (Order API)
 | **Errors** | Failed orders / total orders | < 1% |
 | **Saturation** | Active workflow instances | < 100 concurrent |
 
+## Technology Stack
+- **Build**: Gradle (Kotlin DSL)
+- **Java**: 21 (LTS)
+- **Spring Boot**: 3.2+
+- **Camunda Client**: zeebe-client-java (official Camunda 8 client)
+- **OTel**: Java Agent (automatic instrumentation) + Micrometer (custom business metrics)
+
 ## Implementation Plan
 
 ### Phase 1: Spring Boot App
 - [ ] Scaffold Spring Boot app in `spring-boot-app/`
 - [ ] Create Order API endpoint (POST /orders)
-- [ ] Add OpenTelemetry auto-instrumentation
-- [ ] Add custom business metrics (order latency, throughput, errors)
+- [ ] Add OpenTelemetry auto-instrumentation (Java Agent)
+- [ ] Add custom business metrics with Micrometer (order latency, throughput, errors)
 - [ ] Export metrics to OTel Collector
 
 ### Phase 2: Camunda Workflow
