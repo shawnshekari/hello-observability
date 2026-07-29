@@ -31,23 +31,26 @@ Spring Boot (Order API)
 ## Implementation Plan
 
 ### Phase 1: Spring Boot App
-- [ ] Scaffold Spring Boot app in `spring-boot-app/`
-- [ ] Create Order API endpoint (POST /orders)
-- [ ] Add OpenTelemetry auto-instrumentation (Java Agent)
-- [ ] Add custom business metrics with Micrometer (order latency, throughput, errors)
-- [ ] Export metrics to OTel Collector
+- [x] Scaffold Spring Boot app in `spring-boot-app/`
+- [x] Create Order API endpoint (POST /orders)
+- [x] Add OpenTelemetry auto-instrumentation (Java Agent)
+- [x] Add custom business metrics with Micrometer (order latency, throughput, errors)
+- [x] Export metrics to OTel Collector
+- [x] Add Dockerfile for containerization
+- [x] Add k8s deployment YAML
+- [x] Add unit tests for OrderService and OrderController
 
 ### Phase 2: Camunda Workflow
-- [ ] Create BPMN workflow for order processing
-- [ ] Add service task to call n8n webhook
-- [ ] Add error handling and retry logic
-- [ ] Deploy to Camunda 8
+- [x] Create BPMN workflow for order processing
+- [x] Add service task to call n8n webhook
+- [x] Add error handling and retry logic
+- [ ] Deploy to Camunda 8 (requires environment up)
 
 ### Phase 3: n8n Workflow
-- [ ] Create webhook workflow for order validation
+- [x] Create webhook workflow for order validation
 - [ ] Add configurable delay (simulated API call)
 - [ ] Add error injection for testing
-- [ ] Deploy to n8n
+- [ ] Deploy to n8n (requires environment up)
 
 ### Phase 4: Camunda Operate
 - [ ] Enable Camunda Operate in `helm-values/camunda-values.yaml`
