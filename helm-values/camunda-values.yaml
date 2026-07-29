@@ -12,7 +12,7 @@ zeebe:
 
 zeebe-gateway:
   replicas: 1
-  # NEW BLOCK: Satisfy GKE Autopilot minimum CPU requirements
+  # Satisfy GKE Autopilot minimum CPU requirements
   resources:
     requests:
       cpu: 500m
@@ -22,7 +22,7 @@ zeebe-gateway:
       memory: 1Gi
 
 operate:
-  enabled: false
+  enabled: true
 tasklist:
   enabled: false
 optimize:

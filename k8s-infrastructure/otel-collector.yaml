@@ -35,16 +35,30 @@ spec:
             endpoint: 0.0.0.0:4317
           http:
             endpoint: 0.0.0.0:4318
-      # NEW: Scrape Camunda Zeebe Metrics
+      # Scrape metrics from all components
       prometheus:
         config:
           scrape_configs:
+            # Camunda Zeebe Broker metrics (workflow execution metrics)
             - job_name: 'camunda-zeebe'
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                # Point directly to the Zeebe Broker pod in the camunda namespace
                 - targets: ['camunda-poc-zeebe-0.camunda-poc-zeebe.camunda.svc.cluster.local:9600']
+
+            # Camunda Operate metrics (workflow instance tracking)
+            - job_name: 'camunda-operate'
+              scrape_interval: 15s
+              metrics_path: '/actuator/prometheus'
+              static_configs:
+                - targets: ['camunda-poc-operate-0.camunda-poc-operate.camunda.svc.cluster.local:8080']
+
+            # Spring Boot app metrics (custom business metrics)
+            - job_name: 'hello-observability-app'
+              scrape_interval: 15s
+              metrics_path: '/actuator/prometheus'
+              static_configs:
+                - targets: ['hello-observability-app.default.svc.cluster.local:8080']
 
     exporters:
       googlecloud:
@@ -55,7 +69,6 @@ spec:
         traces:
           receivers: [otlp]
           exporters: [googlecloud]
-        # NEW: Route the metrics to Google Cloud
         metrics:
           receivers: [prometheus]
           exporters: [googlecloud]
