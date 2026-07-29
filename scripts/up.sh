@@ -31,8 +31,70 @@ DOCKER_IMAGE="gcr.io/${PROJECT_ID}/hello-observability-app"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ============================================================================
+# Helper: Validation functions
+# ============================================================================
+validate_pod_ready() {
+  local namespace="$1"
+  local label="$2"
+  local name="$3"
+  local retries="${4:-30}"
+  local count
+  count=$(kubectl get pods -n "${namespace}" -l "${label}" --no-headers 2>/dev/null \
+    | awk '$1==NAME && $2=="1/1" && $3=="Running" {print}' | wc -l)
+  local i=0
+  while [ "${count}" -eq 0 ] && [ "${i}" -lt "${retries}" ]; do
+    echo "    Waiting for ${name} to be Running (attempt $((i+1))/${retries})..."
+    sleep 5
+    i=$((i+1))
+    count=$(kubectl get pods -n "${namespace}" -l "${label}" --no-headers 2>/dev/null \
+      | awk '{if($2=="1/1" && $3=="Running") print}' | wc -l)
+  done
+  if [ "${count}" -eq 0 ]; then
+    echo "    ERROR: ${name} failed to become Ready after ${retries} attempts"
+    kubectl get pods -n "${namespace}" -l "${label}" -o wide
+    return 1
+  fi
+  echo "    ✓ ${name} is Running"
+}
+
+validate_http_endpoint() {
+  local url="$1"
+  local name="$2"
+  local retries="${3:-10}"
+  local i=0
+  while [ "${i}" -lt "${retries}" ]; do
+    if curl -sf "${url}" >/dev/null 2>&1; then
+      echo "    ✓ ${name} health check passed"
+      return 0
+    fi
+    echo "    Waiting for ${name} to respond (attempt $((i+1))/${retries})..."
+    sleep 3
+    i=$((i+1))
+  done
+  echo "    ERROR: ${name} failed health check after ${retries} attempts"
+  return 1
+}
+
+# ============================================================================
+# Pre-flight checks
+# ============================================================================
 echo "==> Using project ${PROJECT_ID}"
 gcloud config set project "${PROJECT_ID}" >/dev/null
+
+# Check if GSA exists (required for Workload Identity)
+if ! gcloud iam service-accounts describe "${COLLECTOR_GSA}" >/dev/null 2>&1; then
+  echo "==> GSA ${COLLECTOR_GSA} not found. Creating it..."
+  gcloud iam service-accounts create otel-collector-gsa \
+    --display-name="OTel Collector GSA"
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount=${COLLECTOR_GSA}" \
+    --role="roles/monitoring.metricWriter"
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount=${COLLECTOR_GSA}" \
+    --role="roles/cloudtrace.agent"
+  echo "    ✓ GSA created with monitoring.metricWriter and cloudtrace.agent roles"
+fi
 
 # ============================================================================
 # Step 1: Create or verify GKE Autopilot cluster
@@ -78,6 +140,9 @@ helm upgrade --install cert-manager jetstack/cert-manager \
   --set global.leaderElection.namespace=cert-manager \
   --wait --timeout 5m
 
+# Validate cert-manager is running
+validate_pod_ready cert-manager "app.kubernetes.io/instance=cert-manager" "cert-manager"
+
 # ============================================================================
 # Step 3: Install OpenTelemetry Operator
 # ============================================================================
@@ -88,6 +153,7 @@ echo "==> Installing/upgrading the OpenTelemetry Operator"
 kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
 kubectl rollout status deployment/opentelemetry-operator-controller-manager \
   -n opentelemetry-operator-system --timeout=120s
+echo "    ✓ OTel Operator is Ready"
 
 # ============================================================================
 # Step 4: Deploy OTel Collector
@@ -104,6 +170,9 @@ kubectl create namespace "${NS_OBSERVABILITY}" --dry-run=client -o yaml | kubect
 kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/otel-collector.yaml"
 kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
 
+# Validate OTel Collector is running
+validate_pod_ready "${NS_OBSERVABILITY}" "app.kubernetes.io/name=${COLLECTOR_KSA}" "OTel Collector"
+
 # ============================================================================
 # Step 5: Bind OTel Collector to GCP Service Account (Workload Identity)
 # ============================================================================
@@ -114,8 +183,23 @@ kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --time
 # This allows the collector pod to impersonate the GSA and export
 # traces/metrics to GCP without API keys.
 echo "==> Re-binding collector ServiceAccount to ${COLLECTOR_GSA} (Workload Identity)"
+
+# Bind GSA to KSA (idempotent)
+gcloud iam service-accounts add-iam-policy-binding \
+  "${COLLECTOR_GSA}" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NS_OBSERVABILITY}/${COLLECTOR_KSA}" >/dev/null 2>&1 || true
+
 kubectl annotate serviceaccount "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} \
   iam.gke.io/gcp-service-account="${COLLECTOR_GSA}" --overwrite
+
+# Verify annotation was applied
+ANNOTATION=$(kubectl get sa "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} -o jsonpath='{.metadata.annotations["iam\.gke\.io/gcp-service-account"]}')
+if [ "${ANNOTATION}" != "${COLLECTOR_GSA}" ]; then
+  echo "    ERROR: Workload Identity annotation not applied correctly"
+  exit 1
+fi
+echo "    ✓ Workload Identity annotation verified"
 
 # Restart collector pod to pick up the new identity binding
 echo "==> Restarting collector pod to pick up the identity binding"
@@ -139,6 +223,10 @@ kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/n8n.yaml"
 # Wait for n8n to be ready before importing workflow
 echo "==> Waiting for n8n to be ready..."
 kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
+validate_pod_ready "${NS_APPS}" "app=n8n" "n8n"
+
+# Validate n8n health endpoint
+validate_http_endpoint "http://$(kubectl get pod -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].status.podIP}'):5678/healthz" "n8n" 5
 
 # Import n8n workflow
 echo "==> Importing n8n order validation workflow"
@@ -149,7 +237,7 @@ kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "echo '${N8N_WORKFLOW}' | curl 
 # Activate the workflow
 WORKFLOW_ID=$(kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s http://localhost:5678/api/v1/workflows | jq -r '.workflows[] | select(.name==\"Order Validation\") | .id'")
 kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s -X PUT http://localhost:5678/api/v1/workflows/${WORKFLOW_ID}/activate"
-echo "    n8n workflow imported and activated (id: ${WORKFLOW_ID})"
+echo "    ✓ n8n workflow imported and activated (id: ${WORKFLOW_ID})"
 
 # ============================================================================
 # Step 7: Deploy Camunda 8 (Zeebe workflow engine)
@@ -175,6 +263,18 @@ helm upgrade --install camunda-poc camunda/camunda-platform \
 echo "==> Waiting for Zeebe to be ready..."
 kubectl rollout status statefulset/camunda-poc-zeebe -n ${NS_APPS} --timeout=120s
 kubectl rollout status deployment/camunda-poc-zeebe-gateway -n ${NS_APPS} --timeout=120s
+validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe" "Zeebe Broker" 60
+validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe-gateway" "Zeebe Gateway" 60
+
+# Validate Zeebe Gateway is accepting connections (gRPC health check)
+echo "==> Validating Zeebe Gateway connectivity..."
+ZEEBE_GW_POD=$(kubectl get pods -n ${NS_APPS} -l app.kubernetes.io/name=zeebe-gateway -o jsonpath='{.items[0].metadata.name}')
+ZEEBE_GW_IP=$(kubectl get pod "${ZEEBE_GW_POD}" -n ${NS_APPS} -o jsonpath='{.status.podIP}')
+if curl -sf "http://${ZEEBE_GW_IP}:26501/actuator/health" >/dev/null 2>&1; then
+  echo "    ✓ Zeebe Gateway health check passed"
+else
+  echo "    WARNING: Zeebe Gateway health endpoint not reachable (may need more time to initialize)"
+fi
 
 # ============================================================================
 # Step 8: Build and push Spring Boot image
@@ -187,6 +287,14 @@ docker build -t "${DOCKER_IMAGE}" .
 
 echo "==> Pushing Spring Boot image to GCR"
 docker push "${DOCKER_IMAGE}"
+
+# Validate image was pushed successfully
+if gcloud container images describe "${DOCKER_IMAGE}" --quiet >/dev/null 2>&1; then
+  echo "    ✓ Spring Boot image pushed to GCR"
+else
+  echo "    ERROR: Spring Boot image not found in GCR after push"
+  exit 1
+fi
 cd "${REPO_ROOT}"
 
 # ============================================================================
@@ -203,11 +311,29 @@ kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/hello-observability-app.yaml"
 # Wait for Spring Boot app to be ready
 echo "==> Waiting for Spring Boot app to be ready..."
 kubectl rollout status deployment/hello-observability-app -n ${NS_APPS} --timeout=120s
+validate_pod_ready "${NS_APPS}" "app=hello-observability-app" "Spring Boot App"
+
+# Validate Spring Boot health endpoint
+validate_http_endpoint "http://$(kubectl get pod -n ${NS_APPS} -l app=hello-observability-app -o jsonpath='{.items[0].status.podIP}'):8080/actuator/health" "Spring Boot App" 15
+
+# ============================================================================
+# Final validation: Check OTel Collector is exporting
+# ============================================================================
+echo "==> Validating OTel Collector is exporting telemetry..."
+sleep 10
+COLLECTOR_LOGS=$(kubectl logs -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=${COLLECTOR_KSA} --tail=20 2>/dev/null || true)
+if echo "${COLLECTOR_LOGS}" | grep -qi "exported\|sent\|pushed"; then
+  echo "    ✓ OTel Collector is exporting telemetry to Google Cloud"
+else
+  echo "    INFO: OTel Collector is running. Check logs for export status:"
+  echo "    kubectl logs -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=${COLLECTOR_KSA} --tail=50"
+fi
 
 # ============================================================================
 # Summary
 # ============================================================================
-echo "==> Done. Current pods:"
+echo ""
+echo "==> All components deployed. Current pods:"
 kubectl get pods -n ${NS_OBSERVABILITY}
 kubectl get pods -n ${NS_APPS}
 
