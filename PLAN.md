@@ -53,14 +53,14 @@ Spring Boot (Order API)
 - [ ] Deploy to n8n (requires environment up)
 
 ### Phase 4: Camunda Operate
-- [ ] Enable Camunda Operate in `helm-values/camunda-values.yaml`
+- [x] Enable Camunda Operate in `helm-values/camunda-values.yaml`
 - [ ] Port-forward and verify workflow instances are visible
 - [ ] Use Operate to inspect trace context propagation
 
 ### Phase 5: OTel Metrics
-- [ ] Export custom metrics from Spring Boot
-- [ ] Export workflow metrics from Camunda
-- [ ] Export processing metrics from n8n
+- [x] Export custom metrics from Spring Boot
+- [x] Export workflow metrics from Camunda
+- [x] Export processing metrics from n8n
 - [ ] Verify metrics flow to Google Cloud Monitoring
 
 ### Phase 6: Google Cloud Dashboards
@@ -73,3 +73,6 @@ Spring Boot (Order API)
 - GCP project: `hellootelworld`
 - Region: `us-central1`
 - Cluster: `hello-observability-cluster`
+- Namespaces:
+  - `observability`: OTel Collector
+  - `apps`: n8n, Camunda 8, Spring Boot

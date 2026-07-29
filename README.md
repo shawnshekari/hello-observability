@@ -19,23 +19,23 @@ graph TB
 
     subgraph GKE_Autopilot ["GKE Autopilot Cluster (us-central1)"]
 
-        subgraph NS_Default ["Namespace: default"]
+        subgraph NS_OBSERVABILITY ["Namespace: observability"]
+            direction TB
+            OTel["📡 OTel Collector Contrib"]
+        end
+
+        subgraph NS_APPS ["Namespace: apps"]
             direction TB
             Spring["☕ Spring Boot App :8080"]
             n8n["🤖 n8n Webhook :5678"]
-            OTel["📡 OTel Collector Contrib"]
+            ZeebeGW["🚪 Zeebe Gateway"]
+            ZeebeBroker["⚙️ Zeebe Broker-0"]
+            Operate["👁️ Camunda Operate"]
 
             %% Workflow Flow
             Spring -->|"Start Workflow"| ZeebeGW
             Spring -.->|"OTLP Traces + Metrics"| OTel
             n8n -.->|"OTLP Traces"| OTel
-        end
-
-        subgraph NS_Camunda ["Namespace: camunda"]
-            direction TB
-            ZeebeGW["🚪 Zeebe Gateway"]
-            ZeebeBroker["⚙️ Zeebe Broker-0"]
-            Operate["👁️ Camunda Operate"]
 
             %% Internal Zeebe Flow
             ZeebeGW -->|"gRPC"| ZeebeBroker
@@ -157,7 +157,7 @@ OTel Collector.
 kubectl apply -f k8s-infrastructure/n8n.yaml
 ```
 
-To verify traces: Port-forward the service (`kubectl port-forward svc/n8n-service 5678:5678`),
+To verify traces: Port-forward the service (`kubectl port-forward svc/n8n-service 5678:5678 -n apps`),
 trigger a manual workflow, and check GCP Cloud Trace.
 
 2. Deploy Headless Camunda 8 (Zeebe)
@@ -172,7 +172,7 @@ helm repo add camunda https://helm.camunda.io
 helm repo update
 
 helm install camunda-poc camunda/camunda-platform \
-  --namespace camunda \
+  --namespace apps \
   --create-namespace \
   --version 11.12.3 \
   -f helm-values/camunda-values.yaml
@@ -180,7 +180,7 @@ helm install camunda-poc camunda/camunda-platform \
 
 (If Zeebe pods get stuck in CrashLoop or refuse to become Ready due to split-brain Raft state
 from a previous deployment, wipe the state by deleting the PVCs: `kubectl delete pvc --all -n
-camunda` and reinstall).
+apps` and reinstall).
 
 ### Phase 3: Spring Boot App
 
@@ -199,12 +199,12 @@ After deployment, verify everything is working:
 
 1. **Check OTel Collector logs** for successful exports:
    ```bash
-   kubectl logs -n default -l app.kubernetes.io/name=cluster-collector-collector --tail=50
+   kubectl logs -n observability -l app.kubernetes.io/name=cluster-collector-collector --tail=50
    ```
 
 2. **Test n8n webhook** (port-forward first):
    ```bash
-   kubectl port-forward svc/n8n-service 5678:5678
+   kubectl port-forward svc/n8n-service 5678:5678 -n apps
    curl -X POST http://localhost:5678/webhook/order-validation \
      -H "Content-Type: application/json" \
      -d '{"orderId": "test-1", "itemName": "Widget", "quantity": 2}'
@@ -212,7 +212,7 @@ After deployment, verify everything is working:
 
 3. **Test Spring Boot app** (port-forward first):
    ```bash
-   kubectl port-forward svc/hello-observability-app 8080:80
+   kubectl port-forward svc/hello-observability-app 8080:80 -n apps
    curl -X POST http://localhost:8080/orders \
      -H "Content-Type: application/json" \
      -d '{"orderId": "test-1", "itemName": "Widget", "quantity": 2}'
