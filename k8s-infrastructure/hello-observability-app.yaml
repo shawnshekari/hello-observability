@@ -13,6 +13,44 @@ spec:
       labels:
         app: hello-observability-app
     spec:
+      # The app's @Deployment annotation deploys order-process.bpmn to Zeebe
+      # synchronously at Spring Boot startup, over the Zeebe Gateway's REST
+      # port - and it's fatal, not retried: if that call fails, the whole
+      # app crashes (see ISSUE.md #2 addendum). Camunda can take several
+      # minutes to become ready, and up.sh deploys it in parallel with this
+      # app, so without this the pod would crash-loop repeatedly on every
+      # fresh bring-up. This initContainer blocks pod startup until the
+      # gateway's REST port is actually reachable, so the app only starts
+      # once its hard dependency is there - a standard k8s wait-for-dependency
+      # pattern, and less noisy than relying on crash-loop-backoff to
+      # eventually succeed.
+      #
+      # The extra sleep after the port opens is a heuristic, not a
+      # guarantee - the port can accept TCP connections slightly before
+      # Zeebe's internal partition/leader election is fully ready to accept
+      # a deploy command. If that race is still hit, Kubernetes' normal
+      # restart-and-retry remains the fallback safety net, just from a much
+      # better starting point than "definitely crash-loops for minutes".
+      initContainers:
+      - name: wait-for-zeebe-gateway
+        image: busybox:1.36
+        command:
+          - sh
+          - -c
+          - |
+            until nc -z camunda-poc-zeebe-gateway.apps.svc.cluster.local 8080; do
+              echo "Waiting for Zeebe Gateway REST port to be reachable..."
+              sleep 5
+            done
+            echo "Zeebe Gateway REST port is reachable, waiting a bit longer for it to be ready..."
+            sleep 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
       containers:
       - name: hello-observability-app
         image: gcr.io/hellootelworld/hello-observability-app:latest

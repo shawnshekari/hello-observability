@@ -19,8 +19,21 @@ management:
         properties:
           otel.service.name: ${spring.application.name}
 
+# Verified against io.camunda:camunda-spring-boot-starter:8.8.0 directly
+# (CamundaClientProperties.java / modes/self-managed.yaml in the camunda/camunda
+# repo at the 8.8.0 tag) rather than assumed - the previous "simple" mode value
+# doesn't exist as an enum constant (only selfManaged/saas do, matched leniently
+# from "self-managed"/"saas"), and "camunda.client.zeebe.gateway-address" isn't
+# a recognized property or legacy alias at this client version - the current
+# property is the flat "camunda.client.grpc-address", which must be an absolute
+# URI including scheme.
 camunda:
   client:
-    mode: simple
-    zeebe:
-      gateway-address: ${ZEEBE_GATEWAY_ADDRESS:camunda-poc-zeebe-gateway.apps.svc.cluster.local:26500}
+    mode: self-managed
+    grpc-address: ${CAMUNDA_CLIENT_GRPC_ADDRESS:http://camunda-poc-zeebe-gateway.apps.svc.cluster.local:26500}
+    # BPMN auto-deployment (@Deployment on HelloObservabilityApplication) goes over
+    # REST, not gRPC - without this it silently falls back to the self-managed
+    # mode default of http://localhost:8088, which doesn't exist in the pod.
+    # Port 8080 verified against the camunda-platform chart's
+    # zeebeGateway.service.restPort default.
+    rest-address: ${CAMUNDA_CLIENT_REST_ADDRESS:http://camunda-poc-zeebe-gateway.apps.svc.cluster.local:8080}
