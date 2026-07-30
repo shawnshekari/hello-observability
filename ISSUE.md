@@ -55,6 +55,49 @@ rewrite since that file needs a structural rewrite regardless of the namespace f
 gateway-address bug has been fixed independently since it also affects the (currently unused)
 `CamundaClient` config. Items 1 and 3 are open - see `PLAN.md`.
 
+**Addendum (2026-07-30)**: adding `io.camunda:camunda-spring-boot-starter:8.8.0` (item 1's fix)
+surfaced two more bugs in `application.yml`, both caught by actually running `./gradlew bootRun`
+locally rather than assuming the config was right:
+- `camunda.client.mode: simple` isn't a valid value - `CamundaClientProperties.ClientMode` (in the
+  `camunda-spring-boot-starter` source at the 8.8.0 tag) only defines `selfManaged`/`saas`. This
+  threw `IllegalStateException: Error while post processing camunda properties` at startup, not a
+  silent failure.
+- `camunda.client.zeebe.gateway-address` (the property item 4 "fixed" the value of) isn't consumed
+  by anything at this client version, and isn't in the starter's legacy-property mapping table
+  either (checked `camunda-client-legacy-property-mappings.properties` in the same repo/tag) - the
+  current property is the flat `camunda.client.grpc-address`, requiring an absolute URI including
+  scheme. Item 4's earlier fix corrected the *value* but not the fact that the *key* was already
+  dead.
+
+Both fixed; confirmed with a local `bootRun` that the Spring context now starts cleanly and a real
+`zeebeClient` bean is constructed (log: `Creating zeebeClient using zeebeClientConfiguration`).
+Note the bean is still the deprecated `ZeebeClient` type, not the newer `CamundaClient` interface
+(`ZeebeClient is deprecated and will be removed in version 8.10` - both expose the same command
+API for now, e.g. `newCreateInstanceCommand()`). Decided to keep `ZeebeClient` for now since it's
+what the starter actually wires up by default at 8.8.0, and track the migration as `PLAN.md`
+Phase 7 (upgrade to Camunda 8.10, which is what the real project will run).
+
+**Addendum 2 (2026-07-30)**: wiring `OrderService` to actually call `ZeebeClient` and adding
+`@Deployment` to auto-deploy the BPMN surfaced two more bugs, again caught by running the app
+locally rather than assuming:
+- `camunda.client.rest-address` was never set. BPMN auto-deployment goes over the REST API, not
+  gRPC (confirmed via stack trace: `DeployResourceCommandStep2.send()` hit
+  `http://localhost:8088`, the `self-managed` mode's REST default), so it silently never had a
+  chance to reach the real Zeebe Gateway. Fixed by setting `camunda.client.rest-address` to the
+  gateway's REST port (8080, confirmed against the `camunda-platform` chart's
+  `zeebeGateway.service.restPort` default).
+- `@Deployment`'s startup-time deploy call is synchronous and unconditionally fatal on failure -
+  traced into `DeploymentAnnotationProcessor.start()` (`clients/camunda-spring-boot-starter` in
+  the `camunda/camunda` repo at the 8.8.0 tag): it calls `commandStep2.send().join()` directly
+  inside a `SmartLifecycle` bean's `start()`, with no retry or leniency. If Zeebe's REST gateway
+  isn't reachable at the exact moment this app starts, the whole Spring context fails to start and
+  the pod crashes - not a degraded/partial startup. Since Camunda can take several minutes to
+  become ready and `up.sh` deploys it in parallel with this app (no ordering dependency between
+  them today), this app would crash-loop repeatedly on every fresh cluster bring-up. Fixed with a
+  `wait-for-zeebe-gateway` initContainer in `hello-observability-app.yaml` that blocks pod startup
+  until the gateway's REST port is reachable, rather than relying on Kubernetes'
+  crash-loop-backoff to eventually get there.
+
 **Affected Components**:
 - `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
 - `spring-boot-app/src/main/resources/workflows/order-process.bpmn`

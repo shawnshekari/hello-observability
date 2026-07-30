@@ -89,28 +89,55 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
 - [x] Add Dockerfile for containerization
 - [x] Add k8s deployment YAML
 - [x] Add unit tests for OrderService and OrderController
-- [ ] Add `io.camunda:camunda-spring-boot-starter:8.8.0` dependency (gives us an
-      auto-configured `CamundaClient` bean from the existing `camunda.client.*` properties)
-- [ ] Wire `OrderService`/`OrderController` to actually start a Camunda process instance per
-      order (`orderId`/`itemName`/`quantity` as process variables) - today it's a stub that just
-      sleeps and returns
+- [x] Add `io.camunda:camunda-spring-boot-starter:8.8.0` dependency (gives us an
+      auto-configured client bean from `camunda.client.*` properties). Found two more bugs while
+      verifying this locally with `./gradlew bootRun` (context failed to start until both were
+      fixed - see `ISSUE.md` #2 addendum): `camunda.client.mode: simple` isn't a valid value at
+      this client version (only `self-managed`/`saas` are), and `camunda.client.zeebe.gateway-address`
+      isn't a recognized property or legacy alias at all - the current property is the flat
+      `camunda.client.grpc-address`. Both fixed in `application.yml`; confirmed the app now boots
+      cleanly (`Started HelloObservabilityApplication`) with a real `zeebeClient` bean created.
+- [x] Wire `OrderService` to start a Camunda process instance per order (`orderId`/`itemName`/
+      `quantity` as process variables) via the (deprecated-but-functional, see Phase 7)
+      `ZeebeClient` bean; `orders.created`/`orders.failed` now reflect whether the process
+      instance actually started, not just whether the HTTP request was received. Added
+      `@Deployment(resources = "classpath*:/workflows/*.bpmn")` on the application class so the
+      BPMN auto-deploys at startup. Verified locally (`./gradlew test` + `bootRun`), which
+      surfaced two more real issues fixed along the way:
+  - `camunda.client.rest-address` was never set, so BPMN auto-deployment (which goes over REST,
+    not gRPC) silently defaulted to `http://localhost:8088` - fixed in `application.yml`.
+  - `@Deployment`'s startup deploy call is synchronous and fatal with no retry: if Zeebe's REST
+    gateway isn't reachable yet, the whole app crashes at startup (traced into
+    `DeploymentAnnotationProcessor.start()` in the starter's source - confirmed, not guessed).
+    Since Camunda can take minutes to become ready and deploys in parallel with this app, added an
+    `initContainer` to `hello-observability-app.yaml` that blocks pod startup until the Zeebe
+    Gateway's REST port is reachable, instead of relying on Kubernetes crash-loop-backoff to
+    eventually succeed.
 
 ### Phase 2: Camunda Workflow (Connector-based)
-- [ ] Enable the Connectors runtime in `helm-values/camunda-values.yaml`
+- [x] Enable the Connectors runtime in `helm-values/camunda-values.yaml`
       (`connectors.enabled: true`); explicitly set `connectors.inbound.mode: disabled` since this
-      PoC only needs outbound calls and identity/OAuth is disabled cluster-wide
-- [ ] Rewrite `order-process.bpmn`:
-  - [ ] Give `ValidateOrder` a real `zeebe:taskDefinition type="io.camunda:http-json:1"`
+      PoC only needs outbound calls and identity/OAuth is disabled cluster-wide (verified with
+      `helm template` against the actual chart - renders cleanly)
+- [x] Rewrite `order-process.bpmn`:
+  - [x] Give `ValidateOrder` a real `zeebe:taskDefinition type="io.camunda:http-json:1"`
         (replaces the invented `zeebe:httpMethod`/`zeebe:httpUrl` attributes, which Zeebe
         silently drops, leaving the task with no job type and an unpassable deployment)
-  - [ ] Add the connector's real input mapping: `method`, `url` (fixed to the `apps` namespace -
+  - [x] Add the connector's real input mapping: `method`, `url` (fixed to the `apps` namespace -
         `http://n8n-service.apps.svc.cluster.local:5678/webhook/order-validation`), `headers`,
         `body` (FEEL context built from the process variables)
-  - [ ] Map the response via `resultVariable`/`resultExpression` (`zeebe:taskHeader`s)
-  - [ ] Fix the malformed error-handling branch: a `bpmn:boundaryEvent` cannot be nested inside a
-        `bpmn:intermediateCatchEvent` - move it to a real boundary event attached to
-        `ValidateOrder`, and define the `ValidationError` `bpmn:error` element it references
-        (currently referenced but never defined)
+  - [x] Map the response via `resultVariable`/`resultExpression` (`zeebe:taskHeader`s); added
+        `errorExpression` to turn an HTTP >= 400 response into a real BPMN error
+        (`bpmnError(...)`), separate from n8n successfully responding `valid: false`, which is a
+        normal business outcome, not an error
+  - [x] Fix the malformed error-handling branch: a `bpmn:boundaryEvent` cannot be nested inside a
+        `bpmn:intermediateCatchEvent` - moved to a real boundary event attached to `ValidateOrder`
+        (`attachedToRef`), and defined the `ValidationServiceError` `bpmn:error` element it
+        references (previously referenced but never defined)
+  - [x] Added an exclusive gateway (`Gateway_OrderValid`) branching on `validationResult.valid` -
+        the previous file had no actual valid/invalid branching, only the (broken) error path
+  - Validated against `zeebe-bpmn-moddle` (the schema library Camunda's own tooling uses): parses
+    clean with no warnings, `taskDefinition`/`errorRef`/gateway `default` all resolve correctly
 - [ ] Deploy the BPMN (auto-deploy via the Spring starter's classpath resource deployment, or a
       manual deploy step) and confirm it passes Zeebe's deployment validation
 - [ ] Verify end-to-end: `POST /orders` → process instance created → Connector calls n8n →
@@ -142,6 +169,30 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
 - [ ] Add SLO burn rate alerts
 - [ ] Correlate traces with metrics
 - [ ] Add log correlation with trace IDs
+
+### Phase 7: Upgrade to Camunda 8.10 (deferred - not blocking Phases 1-6)
+The real project this PoC informs will run Camunda 8.10, not 8.8.0. `camunda-spring-boot-starter`
+currently auto-configures the older `ZeebeClient` bean (deprecated, slated for removal in 8.10 -
+see `ISSUE.md` #2 addendum), which is what Phase 1's `OrderService` wiring uses. That's the right
+call for now: it's what the starter actually wires up by default at 8.8.0, and switching to the
+newer `io.camunda.client.CamundaClient` bean wasn't confirmed to be a clean drop-in without further
+investigation. Once 8.10 is out:
+- [ ] Migrate `ZeebeClient` usage in `OrderService` to `io.camunda.client.CamundaClient`
+- [ ] Bump the client dependency to 8.10.x - check the artifact name before assuming it's still
+      `io.camunda:camunda-spring-boot-starter`. The `camunda/camunda` repo's main branch already
+      shows a split into `camunda-spring-boot-3-starter` / `camunda-spring-boot-4-starter` (plus a
+      deprecated alias for the old unversioned name), so this may have changed by the time 8.10
+      ships.
+- [ ] Bump `helm-values/camunda-values.yaml`'s chart/version pin (currently chart 11.12.3 /
+      Camunda 8.6.x, deliberately chosen to avoid the unified-image/Elasticsearch
+      `max_map_count` kernel issues that later versions hit on GKE Autopilot - re-verify whether
+      8.10's deployment model still has that problem before bumping)
+- [ ] Re-check the HTTP JSON connector element template for changes (used v17's property set when
+      writing `order-process.bpmn`'s REST Connector task - Camunda connector templates do version)
+- [ ] Re-run the same verification steps used for the 8.8.0 wiring before deploying: `helm
+      template` against the real chart, `zeebe-bpmn-moddle` schema validation on the BPMN, and a
+      local `./gradlew bootRun` smoke test - all three caught real bugs during the 8.8.0 work that
+      would otherwise have only surfaced live on the cluster
 
 ## Environment
 - GCP project: `hellootelworld`
