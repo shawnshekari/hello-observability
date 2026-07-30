@@ -23,4 +23,4 @@ camunda:
   client:
     mode: simple
     zeebe:
-      gateway-address: ${ZEEBE_GATEWAY_ADDRESS:camunda-poc-zeebe-gateway.camunda.svc.cluster.local:26662}
+      gateway-address: ${ZEEBE_GATEWAY_ADDRESS:camunda-poc-zeebe-gateway.apps.svc.cluster.local:26500}

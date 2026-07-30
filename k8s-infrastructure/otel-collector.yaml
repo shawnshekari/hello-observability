@@ -46,19 +46,26 @@ spec:
               static_configs:
                 - targets: ['camunda-poc-zeebe-0.camunda-poc-zeebe.apps.svc.cluster.local:9600']
 
-            # Camunda Operate metrics (workflow instance tracking)
+            # Camunda Operate metrics (workflow instance tracking). Operate is
+            # a Deployment behind a regular ClusterIP Service (unlike Zeebe's
+            # StatefulSet), so it's addressed by Service name, not per-pod
+            # DNS - and its actuator/prometheus endpoint lives on the
+            # Service's "management" port (9600), not the app port (80/8080).
             - job_name: 'camunda-operate'
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                - targets: ['camunda-poc-operate-0.camunda-poc-operate.apps.svc.cluster.local:8080']
+                - targets: ['camunda-poc-operate.apps.svc.cluster.local:9600']
 
-            # Spring Boot app metrics (custom business metrics)
+            # Spring Boot app metrics (custom business metrics). Scraped
+            # through the Service, so this must be the Service's port (80),
+            # not the container's targetPort (8080) - hitting 8080 directly
+            # against the Service's ClusterIP doesn't connect to anything.
             - job_name: 'hello-observability-app'
               scrape_interval: 15s
               metrics_path: '/actuator/prometheus'
               static_configs:
-                - targets: ['hello-observability-app.apps.svc.cluster.local:8080']
+                - targets: ['hello-observability-app.apps.svc.cluster.local:80']
 
     exporters:
       googlecloud:
