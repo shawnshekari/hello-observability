@@ -2,9 +2,17 @@
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
                   xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                   id="Definitions_1"
                   targetNamespace="http://bpmn.io/schema/bpmn">
+
+  <!-- Thrown by ValidateOrder's errorExpression when n8n itself fails (HTTP
+       >= 400 / unreachable), as opposed to n8n successfully responding with
+       valid=false, which is a normal business outcome handled by the
+       Gateway_OrderValid branch below, not an error. -->
+  <bpmn:error id="ValidationServiceError" name="Validation Service Error" errorCode="VALIDATION_SERVICE_ERROR" />
 
   <bpmn:process id="order-process" name="Order Process" isExecutable="true">
     <bpmn:startEvent id="StartEvent_1" name="Order Received">
@@ -13,43 +21,72 @@
 
     <bpmn:sequenceFlow id="Flow_1" sourceRef="StartEvent_1" targetRef="ValidateOrder" />
 
-    <bpmn:serviceTask id="ValidateOrder" name="Validate Order"
-                      zeebe:type="rest"
-                      zeebe:httpMethod="POST"
-                      zeebe:httpUrl="http://n8n-service.default.svc.cluster.local:5678/webhook/order-validation"
-                      zeebe:responseVariable="validationResult">
+    <!-- REST Connector (io.camunda:http-json:1) calling n8n's order
+         validation webhook. See ISSUE.md #2 / PLAN.md Phase 2: this
+         replaces a previous version that used invented zeebe:httpMethod /
+         zeebe:httpUrl attributes, which aren't part of Zeebe's real BPMN
+         schema and left the task with no job type at all. -->
+    <bpmn:serviceTask id="ValidateOrder" name="Validate Order">
       <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" retries="3" />
         <zeebe:ioMapping>
-          <zeebe:input source="orderId" target="orderId" />
-          <zeebe:input source="itemName" target="itemName" />
-          <zeebe:input source="quantity" target="quantity" />
+          <zeebe:input source="post" target="method" />
+          <zeebe:input source="http://n8n-service.apps.svc.cluster.local:5678/webhook/order-validation" target="url" />
+          <zeebe:input source="={&quot;Content-Type&quot;: &quot;application/json&quot;}" target="headers" />
+          <zeebe:input source="={orderId: orderId, itemName: itemName, quantity: quantity}" target="body" />
         </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="resultVariable" value="validationResult" />
+          <zeebe:header key="resultExpression" value="={valid: response.body.valid, message: response.body.message}" />
+          <zeebe:header key="errorExpression" value="=if response.status &gt;= 400 then bpmnError(&quot;VALIDATION_SERVICE_ERROR&quot;, &quot;n8n validation service returned HTTP &quot; + string(response.status)) else null" />
+        </zeebe:taskHeaders>
       </bpmn:extensionElements>
       <bpmn:incoming>Flow_1</bpmn:incoming>
       <bpmn:outgoing>Flow_2</bpmn:outgoing>
-      <bpmn:outgoing>Flow_Error</bpmn:outgoing>
     </bpmn:serviceTask>
 
-    <bpmn:sequenceFlow id="Flow_2" sourceRef="ValidateOrder" targetRef="CompleteOrder" />
+    <!-- Technical failure path: n8n unreachable or returned an error status.
+         Boundary events attach to the activity via attachedToRef and are
+         top-level children of the process - they cannot be nested inside
+         another event element (the previous version of this file nested a
+         boundaryEvent inside an intermediateCatchEvent, which is invalid
+         BPMN 2.0 structure). -->
+    <bpmn:boundaryEvent id="ValidationServiceErrorBoundary" name="Validation Service Unreachable" attachedToRef="ValidateOrder">
+      <bpmn:outgoing>Flow_ServiceError</bpmn:outgoing>
+      <bpmn:errorEventDefinition errorRef="ValidationServiceError" />
+    </bpmn:boundaryEvent>
+
+    <bpmn:sequenceFlow id="Flow_ServiceError" sourceRef="ValidationServiceErrorBoundary" targetRef="EndEvent_ServiceError" />
+
+    <bpmn:endEvent id="EndEvent_ServiceError" name="Order Failed">
+      <bpmn:incoming>Flow_ServiceError</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="ValidateOrder" targetRef="Gateway_OrderValid" />
+
+    <!-- Business decision on n8n's response - not an error, a normal
+         branch. default="Flow_Invalid" makes rejection the fallback path
+         if validationResult.valid is ever missing/null rather than the
+         process silently stalling. -->
+    <bpmn:exclusiveGateway id="Gateway_OrderValid" name="Order Valid?" default="Flow_Invalid">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:outgoing>Flow_Valid</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Invalid</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:sequenceFlow id="Flow_Valid" sourceRef="Gateway_OrderValid" targetRef="CompleteOrder">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=validationResult.valid</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+
+    <bpmn:sequenceFlow id="Flow_Invalid" sourceRef="Gateway_OrderValid" targetRef="OrderRejected" />
 
     <bpmn:endEvent id="CompleteOrder" name="Order Completed">
-      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:incoming>Flow_Valid</bpmn:incoming>
     </bpmn:endEvent>
 
-    <bpmn:intermediateCatchEvent id="ValidationFailed" name="Validation Failed">
-      <bpmn:incoming>Flow_Error</bpmn:incoming>
-      <bpmn:outgoing>Flow_End</bpmn:outgoing>
-      <bpmn:boundaryEvent id="ErrorBoundary" name="Validation Error">
-        <bpmn:errorEventDefinition errorRef="ValidationError" />
-      </bpmn:boundaryEvent>
-    </bpmn:intermediateCatchEvent>
-
-    <bpmn:endEvent id="EndEvent_1" name="Order Failed">
-      <bpmn:incoming>Flow_End</bpmn:incoming>
+    <bpmn:endEvent id="OrderRejected" name="Order Rejected">
+      <bpmn:incoming>Flow_Invalid</bpmn:incoming>
     </bpmn:endEvent>
-
-    <bpmn:sequenceFlow id="Flow_Error" sourceRef="ValidateOrder" targetRef="ValidationFailed" />
-    <bpmn:sequenceFlow id="Flow_End" sourceRef="ValidationFailed" targetRef="EndEvent_1" />
   </bpmn:process>
 
   <bpmndi:BPMNDiagram id="BPMNDiagram_1">
@@ -58,11 +95,45 @@
         <dc:Bounds x="180" y="102" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="ValidateOrder_di" bpmnElement="ValidateOrder">
-        <dc:Bounds x="300" y="80" width="100" height="80" />
+        <dc:Bounds x="280" y="80" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ValidationServiceErrorBoundary_di" bpmnElement="ValidationServiceErrorBoundary">
+        <dc:Bounds x="312" y="142" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ServiceError_di" bpmnElement="EndEvent_ServiceError">
+        <dc:Bounds x="312" y="250" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_OrderValid_di" bpmnElement="Gateway_OrderValid" isMarkerVisible="true">
+        <dc:Bounds x="440" y="95" width="50" height="50" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="CompleteOrder_di" bpmnElement="CompleteOrder">
-        <dc:Bounds x="480" y="102" width="36" height="36" />
+        <dc:Bounds x="560" y="102" width="36" height="36" />
       </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="OrderRejected_di" bpmnElement="OrderRejected">
+        <dc:Bounds x="560" y="220" width="36" height="36" />
+      </bpmndi:BPMNShape>
+
+      <bpmndi:BPMNEdge id="Flow_1_di" bpmnElement="Flow_1">
+        <di:waypoint x="216" y="120" />
+        <di:waypoint x="280" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ServiceError_di" bpmnElement="Flow_ServiceError">
+        <di:waypoint x="330" y="178" />
+        <di:waypoint x="330" y="250" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_2_di" bpmnElement="Flow_2">
+        <di:waypoint x="380" y="120" />
+        <di:waypoint x="440" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Valid_di" bpmnElement="Flow_Valid">
+        <di:waypoint x="490" y="120" />
+        <di:waypoint x="560" y="120" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Invalid_di" bpmnElement="Flow_Invalid">
+        <di:waypoint x="465" y="145" />
+        <di:waypoint x="465" y="238" />
+        <di:waypoint x="560" y="238" />
+      </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>
