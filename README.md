@@ -30,15 +30,17 @@ graph TB
             n8n["🤖 n8n Webhook :5678"]
             ZeebeGW["🚪 Zeebe Gateway"]
             ZeebeBroker["⚙️ Zeebe Broker-0"]
+            Connectors["🔌 Camunda Connectors Runtime"]
             Operate["👁️ Camunda Operate"]
 
             %% Workflow Flow
-            Spring -->|"Start Workflow"| ZeebeGW
+            Spring -->|"Start Process Instance"| ZeebeGW
             Spring -.->|"OTLP Traces + Metrics"| OTel
             n8n -.->|"OTLP Traces"| OTel
 
             %% Internal Zeebe Flow
             ZeebeGW -->|"gRPC"| ZeebeBroker
+            ZeebeBroker -->|"Job: io.camunda:http-json:1"| Connectors
             ZeebeBroker -->|"Status"| Operate
         end
 
@@ -53,8 +55,9 @@ graph TB
     end
 
     %% Workflow Flow
-    ZeebeBroker -->|"HTTP POST"| n8n
-    n8n -->|"Validation Result"| ZeebeBroker
+    Connectors -->|"HTTP POST"| n8n
+    n8n -->|"Validation Result"| Connectors
+    Connectors -->|"Complete Job"| ZeebeBroker
 
     %% User Interaction
     Browser -->|"POST /orders"| PortForward
@@ -167,6 +170,14 @@ SRE Note: We are deliberately deploying Camunda version 8.6.x (Helm chart 11.12.
 on Autopilot. We also bump the Gateway CPU to 500m to satisfy Autopilot's minimum anti-affinity
 rules.
 
+SRE Note: `helm-values/camunda-values.yaml` currently has `connectors.enabled: false` - this is a
+known gap, tracked as `PLAN.md` Phase 2. Once flipped to `true` it deploys the Camunda Connectors
+Runtime, which is what executes the `io.camunda:http-json:1` (REST) job type the order workflow
+needs to call n8n - see "Camunda → n8n integration" below. When that change lands,
+`connectors.inbound.mode` should be explicitly set to `disabled` too, since this PoC only uses
+outbound connectors (Camunda calling out to n8n) and the chart's default inbound mode (`oauth`)
+doesn't apply here, since Identity/Keycloak are disabled cluster-wide.
+
 ```bash
 helm repo add camunda https://helm.camunda.io
 helm repo update
@@ -181,6 +192,24 @@ helm install camunda-poc camunda/camunda-platform \
 (If Zeebe pods get stuck in CrashLoop or refuse to become Ready due to split-brain Raft state
 from a previous deployment, wipe the state by deleting the PVCs: `kubectl delete pvc --all -n
 apps` and reinstall).
+
+### Camunda → n8n integration: why Connectors, not a job worker
+
+`order-process.bpmn` currently can't be deployed to Zeebe at all - the `ValidateOrder` service
+task uses invented, non-existent attributes instead of a real job type, and there's a structurally
+invalid error-handling branch (see `ISSUE.md` #2 for the full breakdown). The fix, tracked in
+`PLAN.md` Phase 2, is to give `ValidateOrder` a real Camunda HTTP JSON Connector
+(`zeebe:taskDefinition type="io.camunda:http-json:1"`) to call n8n's webhook, rather than a
+hand-written Zeebe job worker. Connectors are Camunda's recommended pattern for exactly this kind
+of integration (call an HTTP endpoint, map the response into process variables) - see
+[Camunda's outbound connector docs](https://docs.camunda.io/docs/components/connectors/use-connectors/outbound/).
+That gets built-in retries (`retries` attribute, with optional backoff), FEEL-based response
+mapping (`resultExpression`), and the call showing up as its own step in Operate, without
+maintaining a separate Java worker for what's just an HTTP POST. A job worker is still the right
+tool when an integration needs real business logic, non-HTTP protocols, or code-level testability
+- this call is none of those, so Connectors is the more production-representative choice for a PoC
+meant to inform how the real system gets built. See `ISSUE.md` #2 and `PLAN.md` Phase 2 for the
+full rationale and implementation steps.
 
 ### Phase 3: Spring Boot App
 

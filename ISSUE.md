@@ -1,5 +1,68 @@
 # ISSUE.md - Active Issues
 
+## 2. Camunda Workflow Was Never Actually Wired Up (FOUND 2026-07-30, FIX IN PROGRESS)
+
+**Symptom**: `scripts/up.sh` timing out during manual testing led to a broader review of the
+project against `PLAN.md`. That review found PLAN.md's checkmarks reflected "the artifact exists"
+(a BPMN file was created, a Camunda client library was added to `build.gradle.kts`) rather than
+"this actually works end to end." None of it had been exercised against a live cluster.
+
+**Root Cause(s)** (several independent bugs, all discovered by reading the code, not by running it):
+
+1. `OrderService.processOrder()` does `Thread.sleep(100)` and returns. It never constructs a
+   Camunda client or starts a process instance. The `camunda.client.*` properties in
+   `application.yml` have nothing consuming them - `build.gradle.kts` only depends on the bare
+   `io.camunda:camunda-client-java` library, not its Spring Boot integration
+   (`io.camunda:camunda-spring-boot-starter`), so there's no autoconfiguration to turn those
+   properties into a bean, and no code anywhere references a `CamundaClient`.
+
+2. `spring-boot-app/src/main/resources/workflows/order-process.bpmn` would fail Zeebe's
+   deployment validation if deployed as-is:
+   - The `ValidateOrder` service task uses `zeebe:type="rest"`, `zeebe:httpMethod`, and
+     `zeebe:httpUrl` as raw XML attributes. None of these are part of the real Zeebe BPMN
+     extension schema (verified against the `zeebe-bpmn-moddle` schema and Camunda's Connector
+     element templates) - a compliant parser ignores unrecognized attributes, so the task ends up
+     with no `zeebe:taskDefinition` at all, which Zeebe requires on every service task.
+   - `<bpmn:boundaryEvent>` is nested inside `<bpmn:intermediateCatchEvent>`. Boundary events must
+     be direct children of `<bpmn:process>` with an `attachedToRef`, not nested inside another
+     event element - this is invalid BPMN 2.0 structure.
+   - The boundary event references `errorRef="ValidationError"`, but no `<bpmn:error
+     id="ValidationError" .../>` element is defined anywhere in the file.
+   - Separately (would still be wrong even if the above were fixed): the webhook URL is
+     `http://n8n-service.default.svc.cluster.local:5678/...` - n8n deploys to the `apps`
+     namespace, not `default`.
+
+3. `helm-values/camunda-values.yaml` has `connectors.enabled: false`. Even a *correctly written*
+   BPMN using the real Camunda REST Connector (`io.camunda:http-json:1`) wouldn't execute, because
+   there'd be no Connector Runtime pod subscribed to that job type.
+
+4. `application.yml`'s Zeebe gateway address default was also wrong on its own terms:
+   `camunda-poc-zeebe-gateway.camunda.svc.cluster.local:26662` - wrong namespace (Camunda deploys
+   to `apps`) and wrong port (confirmed against the `camunda-platform` Helm chart's
+   `values.yaml`: `zeebeGateway.service.grpcPort` defaults to `26500`, not `26662`).
+
+**Decision**: fix the Spring Boot → Camunda → n8n integration using Camunda's REST Connector
+(`io.camunda:http-json:1`) rather than a hand-rolled Zeebe job worker. Connectors are Camunda's
+recommended pattern for exactly this shape of integration (call an HTTP endpoint, map the
+response into process variables) and this PoC is meant to inform how the real project gets built,
+so it should use the pattern Camunda actually recommends for production rather than the fastest
+path to a demo. See `PLAN.md` Phase 2 for the concrete step-by-step fix (enable the Connectors
+runtime, rewrite the BPMN with a real `zeebe:taskDefinition`, add the Spring Boot Camunda starter
+and the actual process-start call).
+
+**Status**: namespace/port bugs (items 2's URL, item 4) are tracked as part of the Phase 2 BPMN
+rewrite since that file needs a structural rewrite regardless of the namespace fix. Item 4's
+gateway-address bug has been fixed independently since it also affects the (currently unused)
+`CamundaClient` config. Items 1 and 3 are open - see `PLAN.md`.
+
+**Affected Components**:
+- `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
+- `spring-boot-app/src/main/resources/workflows/order-process.bpmn`
+- `spring-boot-app/build.gradle.kts`
+- `helm-values/camunda-values.yaml`
+
+---
+
 ## 1. Metrics Export Permission Denied (RESOLVED 2026-07-26)
 
 **Symptom**: OTel Collector `googlecloud` exporter failing to send metrics to Cloud Monitoring.
