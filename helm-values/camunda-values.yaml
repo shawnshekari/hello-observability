@@ -31,7 +31,18 @@ identity:
   enabled: false
 identityKeycloak:
   enabled: false
+# Connectors runtime executes outbound connector job types (e.g. the REST
+# connector, io.camunda:http-json:1) that BPMN service tasks declare. It's
+# a separate deployment that polls Zeebe for those job types.
 connectors:
-  enabled: false
+  enabled: true
+  # inbound.mode defaults to "oauth" in this chart, which is for connectors
+  # that receive inbound webhooks and needs Identity/Keycloak to validate
+  # them. This PoC only uses outbound connectors (Camunda calling out to
+  # n8n), and identity/identityKeycloak are disabled above, so inbound is
+  # explicitly turned off rather than left on an auth mode with nothing to
+  # authenticate against.
+  inbound:
+    mode: disabled
 elasticsearch:
   enabled: false
