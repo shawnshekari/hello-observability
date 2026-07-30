@@ -75,7 +75,7 @@ Note the bean is still the deprecated `ZeebeClient` type, not the newer `Camunda
 (`ZeebeClient is deprecated and will be removed in version 8.10` - both expose the same command
 API for now, e.g. `newCreateInstanceCommand()`). Decided to keep `ZeebeClient` for now since it's
 what the starter actually wires up by default at 8.8.0, and track the migration as `PLAN.md`
-Phase 7 (upgrade to Camunda 8.10, which is what the real project will run).
+Phase 8 (upgrade to Camunda 8.10, which is what the real project will run).
 
 **Addendum 2 (2026-07-30)**: wiring `OrderService` to actually call `ZeebeClient` and adding
 `@Deployment` to auto-deploy the BPMN surfaced two more bugs, again caught by running the app

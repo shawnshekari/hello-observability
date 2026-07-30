@@ -98,7 +98,7 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
       `camunda.client.grpc-address`. Both fixed in `application.yml`; confirmed the app now boots
       cleanly (`Started HelloObservabilityApplication`) with a real `zeebeClient` bean created.
 - [x] Wire `OrderService` to start a Camunda process instance per order (`orderId`/`itemName`/
-      `quantity` as process variables) via the (deprecated-but-functional, see Phase 7)
+      `quantity` as process variables) via the (deprecated-but-functional, see Phase 8)
       `ZeebeClient` bean; `orders.created`/`orders.failed` now reflect whether the process
       instance actually started, not just whether the HTTP request was received. Added
       `@Deployment(resources = "classpath*:/workflows/*.bpmn")` on the application class so the
@@ -143,13 +143,34 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
 - [ ] Verify end-to-end: `POST /orders` → process instance created → Connector calls n8n →
       instance completes → visible in Operate
 
-### Phase 3: n8n Workflow
+### Phase 3: Continuous Integration (GitHub Actions)
+Everything checked off in Phase 2 was verified by hand tonight (`./gradlew test`, a `bootRun`
+smoke test, `helm template` against the real chart, BPMN schema validation via `zeebe-bpmn-moddle`
+in Node.js). None of that runs automatically today - the next person (or the next session) to
+touch `order-process.bpmn` or `OrderService` has no safety net catching the same class of bugs
+found this session (invalid BPMN, dead config properties, broken client wiring) before they reach
+a live cluster. Worth doing now, before Phases 4-6 add more surface area to regress.
+- [ ] Add a GitHub Actions workflow (`.github/workflows/ci.yml`) triggered on push/PR that runs:
+  - [ ] `./gradlew test` in `spring-boot-app/` (OrderService/OrderController unit tests)
+  - [ ] BPMN schema validation for `order-process.bpmn` against `zeebe-bpmn-moddle` - commit the
+        Node.js validation script used ad hoc tonight into the repo (e.g.
+        `scripts/validate-bpmn.mjs`) instead of leaving it as a throwaway script, so CI and local
+        dev use the same check
+  - [ ] `helm template` dry-run of `helm-values/camunda-values.yaml` against the pinned chart
+        version (11.12.3) - this alone would have caught tonight's Connectors config mistakes
+        without needing a live cluster
+- [ ] Cache Gradle dependencies between runs (`actions/setup-java`'s built-in Gradle cache, or
+      `actions/cache`) so CI stays fast
+- [ ] Once CI is green reliably, consider branch protection requiring it to pass before merge to
+      `main` - not urgent for a single-dev/AI workflow today, but cheap to add later if that changes
+
+### Phase 4: n8n Workflow
 - [x] Create webhook workflow for order validation
 - [x] Deploy to n8n (automated in `up.sh`)
 - [ ] Add configurable delay (simulated API call) - stretch goal, not blocking
 - [ ] Add error injection for testing - stretch goal, not blocking
 
-### Phase 4: Camunda Operate
+### Phase 5: Camunda Operate
 - [x] Enable Camunda Operate in `helm-values/camunda-values.yaml`
 - [ ] Port-forward and verify workflow instances are visible (blocked on Phase 2)
 - [ ] Use Operate to inspect trace context propagation through the Connector call (needs
@@ -157,20 +178,20 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
       context onto the outbound HTTP call automatically; check the trace in Cloud Trace once
       Phase 2 is live before assuming it's continuous)
 
-### Phase 5: OTel Metrics
+### Phase 6: OTel Metrics
 - [x] Export custom metrics from Spring Boot
 - [x] Export workflow metrics from Camunda (scrape target now fixed - needs live verification)
 - [x] Export processing metrics from n8n
 - [ ] Verify metrics actually flow to Google Cloud Monitoring (live verification once Phase 0/2
       are deployed and generating traffic)
 
-### Phase 6: Google Cloud Dashboards
+### Phase 7: Google Cloud Dashboards
 - [ ] Create dashboard with golden signals
 - [ ] Add SLO burn rate alerts
 - [ ] Correlate traces with metrics
 - [ ] Add log correlation with trace IDs
 
-### Phase 7: Upgrade to Camunda 8.10 (deferred - not blocking Phases 1-6)
+### Phase 8: Upgrade to Camunda 8.10 (deferred - not blocking Phases 1-7)
 The real project this PoC informs will run Camunda 8.10, not 8.8.0. `camunda-spring-boot-starter`
 currently auto-configures the older `ZeebeClient` bean (deprecated, slated for removal in 8.10 -
 see `ISSUE.md` #2 addendum), which is what Phase 1's `OrderService` wiring uses. That's the right
