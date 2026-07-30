@@ -9,6 +9,40 @@
 #
 # Counterpart to scripts/down.sh. See README.md for the full manual walkthrough
 # and ISSUE.md #1 for why the Workload Identity re-annotation step below exists.
+#
+# ============================================================================
+# Parallel execution model
+# ============================================================================
+# Most of the steps above have no real dependency on each other - they only
+# *look* sequential because they were written top to bottom. The actual
+# dependency graph is:
+#
+#   - GSA/IAM setup, GKE cluster creation, and the Spring Boot image
+#     build+push don't depend on each other at all.
+#   - Everything else needs kubeconfig (i.e. the cluster to exist) and the
+#     two namespaces to exist first.
+#   - Once that's true: the cert-manager -> OTel Operator -> OTel Collector
+#     -> Workload Identity chain, the n8n deploy, and the Camunda install
+#     are all independent of each other. The Spring Boot deploy only needs
+#     its image pushed (from Phase 1) and the namespace - it does NOT need
+#     n8n/Camunda/OTel to be ready, since those are runtime dependencies of
+#     the app (needed when it actually processes an order), not deploy-time
+#     dependencies.
+#
+# So this script runs two phases of background jobs instead of one long
+# sequential chain:
+#
+#   Phase 1 (fully independent): gsa, cluster, image
+#   Phase 2 (needs kubeconfig+namespaces): otel, n8n, camunda, springboot
+#
+# Steps *within* a single job stay sequential where there's a real
+# dependency (e.g. cert-manager's webhook must be Ready before the OTel
+# Operator - which creates a cert-manager Certificate CR - can install).
+#
+# Each job's output is captured to its own log file so concurrent output
+# doesn't interleave into a garbled mess. Live progress can be watched with
+# `tail -f "${JOB_LOG_DIR}"/<job>.log` (the path is printed below); on
+# failure, the failing job's full log is printed automatically.
 set -euo pipefail
 
 # ============================================================================
@@ -32,7 +66,46 @@ DOCKER_IMAGE="gcr.io/${PROJECT_ID}/hello-observability-app"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ============================================================================
-# Helper: Validation functions
+# Helper: background job runner
+# ============================================================================
+# run_job launches a function in the background with its output captured to
+# a log file. wait_job blocks on one job and prints its log only on failure
+# (success stays quiet so parallel output doesn't get noisy). wait_jobs waits
+# on several jobs and lets *all* of them finish before reporting failure, so
+# one early failure doesn't hide a later, unrelated one.
+JOB_LOG_DIR="$(mktemp -d)"
+trap 'rm -rf "${JOB_LOG_DIR}"' EXIT
+declare -A JOB_PIDS=()
+
+run_job() {
+  local job_name="$1"; shift
+  ("$@") >"${JOB_LOG_DIR}/${job_name}.log" 2>&1 &
+  JOB_PIDS["${job_name}"]=$!
+  echo "==> [${job_name}] started (pid ${JOB_PIDS[${job_name}]}, log: ${JOB_LOG_DIR}/${job_name}.log)"
+}
+
+wait_job() {
+  local job_name="$1"
+  if wait "${JOB_PIDS[${job_name}]}"; then
+    echo "    ✓ [${job_name}] finished"
+    return 0
+  else
+    echo "    ERROR: [${job_name}] failed. Log:"
+    sed 's/^/    | /' "${JOB_LOG_DIR}/${job_name}.log"
+    return 1
+  fi
+}
+
+wait_jobs() {
+  local failed=0
+  for job_name in "$@"; do
+    wait_job "${job_name}" || failed=1
+  done
+  return "${failed}"
+}
+
+# ============================================================================
+# Helper: validation functions
 # ============================================================================
 validate_pod_ready() {
   local namespace="$1"
@@ -58,263 +131,308 @@ validate_pod_ready() {
   echo "    ✓ ${name} is Running"
 }
 
-validate_http_endpoint() {
-  local url="$1"
-  local name="$2"
-  local retries="${3:-10}"
-  local i=0
-  while [ "${i}" -lt "${retries}" ]; do
-    if curl -sf "${url}" >/dev/null 2>&1; then
-      echo "    ✓ ${name} health check passed"
-      return 0
-    fi
-    echo "    Waiting for ${name} to respond (attempt $((i+1))/${retries})..."
-    sleep 3
-    i=$((i+1))
-  done
-  echo "    ERROR: ${name} failed health check after ${retries} attempts"
-  return 1
+# ============================================================================
+# Phase 1 jobs: no shared dependencies (IAM, cluster, image build)
+# ============================================================================
+
+job_gsa_setup() {
+  echo "==> Ensuring OTel Collector GSA exists with required IAM roles"
+  if ! gcloud iam service-accounts describe "${COLLECTOR_GSA}" >/dev/null 2>&1; then
+    echo "==> GSA ${COLLECTOR_GSA} not found. Creating it..."
+    gcloud iam service-accounts create otel-collector-gsa \
+      --display-name="OTel Collector GSA"
+  fi
+
+  # Grant GSA roles (idempotent - safe to re-run)
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${COLLECTOR_GSA}" \
+    --role="roles/monitoring.metricWriter" >/dev/null 2>&1
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${COLLECTOR_GSA}" \
+    --role="roles/cloudtrace.agent" >/dev/null 2>&1
+  echo "    ✓ GSA has monitoring.metricWriter and cloudtrace.agent roles"
+}
+
+job_cluster_create() {
+  # GKE Autopilot manages node pools for us. We just specify the region and
+  # let GKE handle the infrastructure. This is the simplest way to run K8s.
+  if ! gcloud container clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+    echo "==> Cluster ${CLUSTER_NAME} not found, creating it (this takes several minutes)..."
+
+    # Enable required GCP APIs:
+    # - container.googleapis.com: GKE cluster management
+    # - cloudtrace.googleapis.com: Distributed tracing (OTel traces)
+    # - logging.googleapis.com: Cloud Logging (for logs)
+    # - monitoring.googleapis.com: Cloud Monitoring (for metrics)
+    gcloud services enable container.googleapis.com cloudtrace.googleapis.com logging.googleapis.com monitoring.googleapis.com
+
+    # Create Autopilot cluster (no node management required)
+    gcloud container clusters create-auto "${CLUSTER_NAME}" --region "${REGION}"
+  else
+    echo "==> Cluster ${CLUSTER_NAME} already exists, reusing it"
+  fi
+}
+
+job_docker_build_push() {
+  # Build the Spring Boot app container image and push it to GCR so the
+  # cluster can pull it. This has zero dependency on the cluster itself, so
+  # it runs fully in parallel with cluster/IAM setup - it's one of the
+  # slowest steps in the whole script and was previously stuck running dead
+  # last, after everything else.
+  echo "==> Building Spring Boot image"
+  cd "${REPO_ROOT}/spring-boot-app"
+  docker build -t "${DOCKER_IMAGE}" .
+
+  echo "==> Pushing Spring Boot image to GCR"
+  docker push "${DOCKER_IMAGE}"
+
+  if ! gcloud container images describe "${DOCKER_IMAGE}" --quiet >/dev/null 2>&1; then
+    echo "    ERROR: Spring Boot image not found in GCR after push"
+    return 1
+  fi
+  echo "    ✓ Spring Boot image pushed to GCR"
 }
 
 # ============================================================================
-# Pre-flight checks
+# Phase 2 jobs: need kubeconfig + namespaces to already exist
+# ============================================================================
+
+job_otel_stack() {
+  # Step: cert-manager (required by OTel Operator)
+  #
+  # cert-manager manages TLS certificates in K8s. The OTel Operator depends on
+  # it for webhook certificate management. We use Helm for easy installation.
+  #
+  # GKE Autopilot blocks namespace leadership in kube-system, so we override
+  # the leader election namespace to cert-manager.
+  echo "==> Installing/upgrading cert-manager"
+  helm upgrade --install cert-manager jetstack/cert-manager \
+    --namespace cert-manager \
+    --create-namespace \
+    --version v1.14.4 \
+    --set installCRDs=true \
+    --set global.leaderElection.namespace=cert-manager \
+    --wait --timeout 5m
+  validate_pod_ready cert-manager "app.kubernetes.io/instance=cert-manager" "cert-manager"
+
+  # Step: OpenTelemetry Operator
+  #
+  # The OTel Operator provides a Kubernetes CRD (Custom Resource Definition)
+  # for managing OTel Collectors declaratively. Instead of applying raw
+  # collector YAML, we use the operator to manage the collector lifecycle.
+  # It depends on cert-manager (above) for its webhook TLS certs.
+  echo "==> Installing/upgrading the OpenTelemetry Operator"
+  kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
+  kubectl rollout status deployment/opentelemetry-operator-controller-manager \
+    -n opentelemetry-operator-system --timeout=120s
+  echo "    ✓ OTel Operator is Ready"
+
+  # Step: OTel Collector
+  #
+  # The OTel Collector is the central hub for telemetry data. It:
+  # - Receives OTLP traces from n8n and Spring Boot
+  # - Scrapes Prometheus metrics from Zeebe, Operate, and Spring Boot
+  # - Exports everything to Google Cloud (Trace + Monitoring)
+  #
+  # The collector runs in the 'observability' namespace and uses Workload
+  # Identity to authenticate with GCP APIs.
+  echo "==> Deploying the OTel Collector"
+  kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/otel-collector.yaml"
+  kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
+  validate_pod_ready "${NS_OBSERVABILITY}" "app.kubernetes.io/name=${COLLECTOR_KSA}" "OTel Collector"
+
+  # Step: Bind OTel Collector to GCP Service Account (Workload Identity)
+  #
+  # GKE Autopilot requires Workload Identity for pods to access GCP APIs.
+  # The OTel Operator recreates the collector's ServiceAccount on every
+  # reconcile, so we must re-annotate it here to maintain the binding.
+  #
+  # This allows the collector pod to impersonate the GSA and export
+  # traces/metrics to GCP without API keys. Requires the GSA from the
+  # Phase 1 `gsa` job, which the caller waits on before starting this job.
+  echo "==> Re-binding collector ServiceAccount to ${COLLECTOR_GSA} (Workload Identity)"
+  gcloud iam service-accounts add-iam-policy-binding \
+    "${COLLECTOR_GSA}" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NS_OBSERVABILITY}/${COLLECTOR_KSA}]" >/dev/null 2>&1 || true
+
+  kubectl annotate serviceaccount "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} \
+    iam.gke.io/gcp-service-account="${COLLECTOR_GSA}" --overwrite
+
+  # Verify annotation was applied
+  ANNOTATION=$(kubectl get sa "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} -o jsonpath="{.metadata.annotations.iam\.gke\.io/gcp-service-account}")
+  if [ "${ANNOTATION}" != "${COLLECTOR_GSA}" ]; then
+    echo "    ERROR: Workload Identity annotation not applied correctly"
+    return 1
+  fi
+  echo "    ✓ Workload Identity annotation verified"
+
+  # Restart collector pod to pick up the new identity binding
+  echo "==> Restarting collector pod to pick up the identity binding"
+  kubectl delete pod -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=${COLLECTOR_KSA} --ignore-not-found
+  kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
+}
+
+job_n8n_deploy() {
+  # n8n is a workflow automation tool. We use it to:
+  # - Receive order validation requests from Camunda
+  # - Validate order data (quantity, format, etc.)
+  # - Return validation results to Camunda
+  #
+  # n8n is configured with OpenTelemetry enabled, so it exports traces
+  # to our OTel Collector automatically. It only needs the 'apps' namespace
+  # to exist, not the OTel Collector to be up yet - its OTel exporter will
+  # just retry until the collector is reachable.
+  echo "==> Deploying n8n"
+  kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/n8n.yaml"
+
+  # kubectl rollout status blocks on the Deployment's readinessProbe
+  # (httpGet /healthz), so this alone is a correct, race-free readiness
+  # gate - no need to separately curl the pod from outside the cluster.
+  echo "==> Waiting for n8n to be ready..."
+  kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
+  validate_pod_ready "${NS_APPS}" "app=n8n" "n8n"
+
+  # Import n8n workflow. The n8n image is Alpine-based without curl or jq,
+  # so we exec in and use wget + grep instead. The workflow JSON is
+  # interpolated inside single quotes below, so it must never contain a
+  # literal single-quote character (order-validation.json doesn't today).
+  echo "==> Importing n8n order validation workflow"
+  N8N_POD=$(kubectl get pods -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].metadata.name}')
+  N8N_WORKFLOW=$(cat "${REPO_ROOT}/n8n/order-validation.json")
+  kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "echo '${N8N_WORKFLOW}' | wget -qO- --post-data=@- --header='Content-Type: application/json' http://localhost:5678/api/v1/workflows -O /dev/null"
+
+  # Activate the workflow. n8n's Alpine image only has busybox grep/sed, no
+  # jq, so we extract the id with a regex instead of proper JSON parsing.
+  # (Note: a prior version of this line ended with `grep -o '[^"]*$'`, which
+  # can only ever match an empty string here since the string it's applied
+  # to ends in a `"` - that silently produced an empty WORKFLOW_ID. Using
+  # sed's backreference instead.)
+  WORKFLOW_ID=$(kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c 'wget -qO- http://localhost:5678/api/v1/workflows | grep -o "\"id\":\"[^\"]*\",\"name\":\"Order Validation\"" | sed -r "s/\"id\":\"([^\"]*)\".*/\1/"')
+  kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "wget -qO- --method=PUT http://localhost:5678/api/v1/workflows/${WORKFLOW_ID}/activate"
+  echo "    ✓ n8n workflow imported and activated (id: ${WORKFLOW_ID})"
+}
+
+job_camunda_deploy() {
+  # Camunda 8 (Zeebe) is our workflow orchestration engine. It:
+  # - Executes BPMN workflows
+  # - Calls n8n for order validation
+  # - Exports metrics to OTel Collector (scraped via Prometheus)
+  #
+  # We use Helm chart 11.12.3 (Camunda 8.6.x) to avoid kernel issues on
+  # Autopilot. Only Zeebe + Gateway + Operate are deployed (no Elasticsearch).
+  # This only needs the 'apps' namespace, not n8n/OTel to be ready.
+  echo "==> Deploying Camunda 8 (Zeebe)"
+  helm upgrade --install camunda-poc camunda/camunda-platform \
+    --namespace ${NS_APPS} \
+    --create-namespace \
+    --version 11.12.3 \
+    -f "${REPO_ROOT}/helm-values/camunda-values.yaml" \
+    --wait --timeout 10m
+
+  echo "==> Waiting for Zeebe to be ready..."
+  kubectl rollout status statefulset/camunda-poc-zeebe -n ${NS_APPS} --timeout=120s
+  kubectl rollout status deployment/camunda-poc-zeebe-gateway -n ${NS_APPS} --timeout=120s
+  validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe" "Zeebe Broker" 60
+  validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe-gateway" "Zeebe Gateway" 60
+
+  # Best-effort only: like the old n8n/Spring Boot checks, this curls a pod
+  # IP directly from wherever this script runs, which only succeeds if that
+  # happens to be inside the cluster's VPC. It's a non-fatal warning either
+  # way, gated on the rollout/pod-ready checks above for real signal.
+  echo "==> Validating Zeebe Gateway connectivity..."
+  ZEEBE_GW_POD=$(kubectl get pods -n ${NS_APPS} -l app.kubernetes.io/name=zeebe-gateway -o jsonpath='{.items[0].metadata.name}')
+  ZEEBE_GW_IP=$(kubectl get pod "${ZEEBE_GW_POD}" -n ${NS_APPS} -o jsonpath='{.status.podIP}')
+  # 9600 is the Zeebe Gateway's actuator/management port (verified against
+  # the camunda-platform Helm chart's values.yaml - zeebeGateway.service.httpPort).
+  if curl -sf --connect-timeout 3 --max-time 5 "http://${ZEEBE_GW_IP}:9600/actuator/health" >/dev/null 2>&1; then
+    echo "    ✓ Zeebe Gateway health check passed"
+  else
+    echo "    INFO: Zeebe Gateway health endpoint not reachable from this machine (expected unless running inside the cluster's VPC)"
+  fi
+}
+
+job_springboot_deploy() {
+  # The Spring Boot app is our order service. It:
+  # - Exposes REST API for creating orders
+  # - Calls Camunda to start workflow instances
+  # - Exports custom business metrics via Micrometer/OTel
+  # - Uses OpenTelemetry Java agent for automatic instrumentation
+  #
+  # Deploy-time dependencies are just the pushed image (Phase 1 `image` job,
+  # awaited by the caller before this job starts) and the 'apps' namespace.
+  # It does NOT need Camunda/n8n/OTel to be ready to deploy successfully -
+  # those only matter once it actually processes an order.
+  echo "==> Deploying Spring Boot App"
+  kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/hello-observability-app.yaml"
+
+  # kubectl rollout status blocks on the Deployment's readinessProbe
+  # (httpGet /actuator/health), so this alone is a correct, race-free
+  # readiness gate - no need to separately curl the pod from outside the
+  # cluster the way this script used to.
+  echo "==> Waiting for Spring Boot app to be ready..."
+  kubectl rollout status deployment/hello-observability-app -n ${NS_APPS} --timeout=120s
+  validate_pod_ready "${NS_APPS}" "app=hello-observability-app" "Spring Boot App"
+}
+
+# ============================================================================
+# Pre-flight
 # ============================================================================
 echo "==> Using project ${PROJECT_ID}"
 gcloud config set project "${PROJECT_ID}" >/dev/null
 
-# Check if GSA exists (required for Workload Identity)
-if ! gcloud iam service-accounts describe "${COLLECTOR_GSA}" >/dev/null 2>&1; then
-  echo "==> GSA ${COLLECTOR_GSA} not found. Creating it..."
-  gcloud iam service-accounts create otel-collector-gsa \
-    --display-name="OTel Collector GSA"
-  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount=${COLLECTOR_GSA}" \
-    --role="roles/monitoring.metricWriter"
-  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount=${COLLECTOR_GSA}" \
-    --role="roles/cloudtrace.agent"
-  echo "    ✓ GSA created with monitoring.metricWriter and cloudtrace.agent roles"
-fi
-
 # ============================================================================
-# Step 1: Create or verify GKE Autopilot cluster
+# Phase 1: IAM setup, cluster creation, and image build+push run in parallel
 # ============================================================================
-# GKE Autopilot manages node pools for us. We just specify the region and
-# let GKE handle the infrastructure. This is the simplest way to run K8s.
-if ! gcloud container clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null 2>&1; then
-  echo "==> Cluster ${CLUSTER_NAME} not found, creating it (this takes several minutes)..."
+# None of these three depend on each other.
+echo ""
+echo "==> Phase 1: GSA/IAM setup, cluster creation, and Spring Boot image build+push (parallel)"
+run_job gsa    job_gsa_setup
+run_job cluster job_cluster_create
+run_job image  job_docker_build_push
 
-  # Enable required GCP APIs:
-  # - container.googleapis.com: GKE cluster management
-  # - cloudtrace.googleapis.com: Distributed tracing (OTel traces)
-  # - logging.googleapis.com: Cloud Logging (for logs)
-  # - monitoring.googleapis.com: Cloud Monitoring (for metrics)
-  gcloud services enable container.googleapis.com cloudtrace.googleapis.com logging.googleapis.com monitoring.googleapis.com
-
-  # Create Autopilot cluster (no node management required)
-  gcloud container clusters create-auto "${CLUSTER_NAME}" --region "${REGION}"
-else
-  echo "==> Cluster ${CLUSTER_NAME} already exists, reusing it"
-fi
-
-# Fetch kubeconfig so kubectl can talk to our cluster
+# Everything from here on needs kubeconfig, so block on the cluster job.
+# The gsa and image jobs keep running in the background regardless.
+wait_job cluster
 echo "==> Fetching cluster credentials"
 gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
 
-# ============================================================================
-# Step 2: Install cert-manager (required by OTel Operator)
-# ============================================================================
-# cert-manager manages TLS certificates in K8s. The OTel Operator depends on
-# it for webhook certificate management. We use Helm for easy installation.
-#
-# GKE Autopilot blocks namespace leadership in kube-system, so we override
-# the leader election namespace to cert-manager.
-echo "==> Installing/upgrading cert-manager"
-helm repo add jetstack https://charts.jetstack.io >/dev/null
+# Needed before the Workload Identity rebind inside job_otel_stack. Cheap,
+# so just resolve it now rather than threading it through Phase 2.
+wait_job gsa
+
+# Helm repo add/update touches a shared local repo config file
+# (~/.config/helm/repositories.yaml), so it must NOT run concurrently across
+# jobs - do it once, here, before forking Phase 2.
+echo "==> Adding Helm repositories"
+helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+helm repo add camunda https://helm.camunda.io >/dev/null 2>&1 || true
 helm repo update >/dev/null
-helm upgrade --install cert-manager jetstack/cert-manager \
-  --namespace cert-manager \
-  --create-namespace \
-  --version v1.14.4 \
-  --set installCRDs=true \
-  --set global.leaderElection.namespace=cert-manager \
-  --wait --timeout 5m
 
-# Validate cert-manager is running
-validate_pod_ready cert-manager "app.kubernetes.io/instance=cert-manager" "cert-manager"
-
-# ============================================================================
-# Step 3: Install OpenTelemetry Operator
-# ============================================================================
-# The OTel Operator provides a Kubernetes CRD (Custom Resource Definition)
-# for managing OTel Collectors declaratively. Instead of applying raw
-# collector YAML, we use the operator to manage the collector lifecycle.
-echo "==> Installing/upgrading the OpenTelemetry Operator"
-kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
-kubectl rollout status deployment/opentelemetry-operator-controller-manager \
-  -n opentelemetry-operator-system --timeout=120s
-echo "    ✓ OTel Operator is Ready"
-
-# ============================================================================
-# Step 4: Deploy OTel Collector
-# ============================================================================
-# The OTel Collector is the central hub for telemetry data. It:
-# - Receives OTLP traces from n8n and Spring Boot
-# - Scrapes Prometheus metrics from Zeebe, Operate, and Spring Boot
-# - Exports everything to Google Cloud (Trace + Monitoring)
-#
-# The collector runs in the 'observability' namespace and uses Workload Identity
-# to authenticate with GCP APIs.
-echo "==> Deploying the OTel Collector"
+echo "==> Creating namespaces"
 kubectl create namespace "${NS_OBSERVABILITY}" --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/otel-collector.yaml"
-kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
-
-# Validate OTel Collector is running
-validate_pod_ready "${NS_OBSERVABILITY}" "app.kubernetes.io/name=${COLLECTOR_KSA}" "OTel Collector"
-
-# ============================================================================
-# Step 5: Bind OTel Collector to GCP Service Account (Workload Identity)
-# ============================================================================
-# GKE Autopilot requires Workload Identity for pods to access GCP APIs.
-# The OTel Operator recreates the collector's ServiceAccount on every
-# reconcile, so we must re-annotate it here to maintain the binding.
-#
-# This allows the collector pod to impersonate the GSA and export
-# traces/metrics to GCP without API keys.
-echo "==> Re-binding collector ServiceAccount to ${COLLECTOR_GSA} (Workload Identity)"
-
-# Bind GSA to KSA (idempotent)
-gcloud iam service-accounts add-iam-policy-binding \
-  "${COLLECTOR_GSA}" \
-  --role="roles/iam.workloadIdentityUser" \
-  --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NS_OBSERVABILITY}/${COLLECTOR_KSA}" >/dev/null 2>&1 || true
-
-kubectl annotate serviceaccount "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} \
-  iam.gke.io/gcp-service-account="${COLLECTOR_GSA}" --overwrite
-
-# Verify annotation was applied
-ANNOTATION=$(kubectl get sa "${COLLECTOR_KSA}" -n ${NS_OBSERVABILITY} -o jsonpath='{.metadata.annotations["iam\.gke\.io/gcp-service-account"]}')
-if [ "${ANNOTATION}" != "${COLLECTOR_GSA}" ]; then
-  echo "    ERROR: Workload Identity annotation not applied correctly"
-  exit 1
-fi
-echo "    ✓ Workload Identity annotation verified"
-
-# Restart collector pod to pick up the new identity binding
-echo "==> Restarting collector pod to pick up the identity binding"
-kubectl delete pod -n ${NS_OBSERVABILITY} -l app.kubernetes.io/name=${COLLECTOR_KSA} --ignore-not-found
-kubectl rollout status deployment/${COLLECTOR_KSA} -n ${NS_OBSERVABILITY} --timeout=120s
-
-# ============================================================================
-# Step 6: Deploy n8n (workflow automation)
-# ============================================================================
-# n8n is a workflow automation tool. We use it to:
-# - Receive order validation requests from Camunda
-# - Validate order data (quantity, format, etc.)
-# - Return validation results to Camunda
-#
-# n8n is configured with OpenTelemetry enabled, so it exports traces
-# to our OTel Collector automatically.
-echo "==> Deploying n8n"
 kubectl create namespace "${NS_APPS}" --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/n8n.yaml"
-
-# Wait for n8n to be ready before importing workflow
-echo "==> Waiting for n8n to be ready..."
-kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
-validate_pod_ready "${NS_APPS}" "app=n8n" "n8n"
-
-# Validate n8n health endpoint
-validate_http_endpoint "http://$(kubectl get pod -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].status.podIP}'):5678/healthz" "n8n" 5
-
-# Import n8n workflow
-echo "==> Importing n8n order validation workflow"
-N8N_POD=$(kubectl get pods -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].metadata.name}')
-N8N_WORKFLOW=$(cat "${REPO_ROOT}/n8n/order-validation.json")
-kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "echo '${N8N_WORKFLOW}' | curl -s -X POST http://localhost:5678/api/v1/workflows -H 'Content-Type: application/json' -d @-"
-
-# Activate the workflow
-WORKFLOW_ID=$(kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s http://localhost:5678/api/v1/workflows | jq -r '.workflows[] | select(.name==\"Order Validation\") | .id'")
-kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "curl -s -X PUT http://localhost:5678/api/v1/workflows/${WORKFLOW_ID}/activate"
-echo "    ✓ n8n workflow imported and activated (id: ${WORKFLOW_ID})"
 
 # ============================================================================
-# Step 7: Deploy Camunda 8 (Zeebe workflow engine)
+# Phase 2: OTel stack, n8n, Camunda, and Spring Boot run in parallel
 # ============================================================================
-# Camunda 8 (Zeebe) is our workflow orchestration engine. It:
-# - Executes BPMN workflows
-# - Calls n8n for order validation
-# - Exports metrics to OTel Collector (scraped via Prometheus)
-#
-# We use Helm chart 11.12.3 (Camunda 8.6.x) to avoid kernel issues on
-# Autopilot. Only Zeebe + Gateway + Operate are deployed (no Elasticsearch).
-echo "==> Deploying Camunda 8 (Zeebe)"
-helm repo add camunda https://helm.camunda.io >/dev/null
-helm repo update >/dev/null
-helm upgrade --install camunda-poc camunda/camunda-platform \
-  --namespace ${NS_APPS} \
-  --create-namespace \
-  --version 11.12.3 \
-  -f "${REPO_ROOT}/helm-values/camunda-values.yaml" \
-  --wait --timeout 10m
+echo ""
+echo "==> Phase 2: OTel stack, n8n, Camunda, and Spring Boot deploy (parallel)"
+run_job otel    job_otel_stack
+run_job n8n     job_n8n_deploy
+run_job camunda job_camunda_deploy
 
-# Wait for Zeebe to be ready
-echo "==> Waiting for Zeebe to be ready..."
-kubectl rollout status statefulset/camunda-poc-zeebe -n ${NS_APPS} --timeout=120s
-kubectl rollout status deployment/camunda-poc-zeebe-gateway -n ${NS_APPS} --timeout=120s
-validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe" "Zeebe Broker" 60
-validate_pod_ready "${NS_APPS}" "app.kubernetes.io/name=zeebe-gateway" "Zeebe Gateway" 60
+# Spring Boot's Deployment needs the pushed image - wait for Phase 1's
+# `image` job (the other three jobs above keep running concurrently while
+# we wait) before starting it.
+wait_job image
+run_job springboot job_springboot_deploy
 
-# Validate Zeebe Gateway is accepting connections (gRPC health check)
-echo "==> Validating Zeebe Gateway connectivity..."
-ZEEBE_GW_POD=$(kubectl get pods -n ${NS_APPS} -l app.kubernetes.io/name=zeebe-gateway -o jsonpath='{.items[0].metadata.name}')
-ZEEBE_GW_IP=$(kubectl get pod "${ZEEBE_GW_POD}" -n ${NS_APPS} -o jsonpath='{.status.podIP}')
-if curl -sf "http://${ZEEBE_GW_IP}:26501/actuator/health" >/dev/null 2>&1; then
-  echo "    ✓ Zeebe Gateway health check passed"
-else
-  echo "    WARNING: Zeebe Gateway health endpoint not reachable (may need more time to initialize)"
-fi
-
-# ============================================================================
-# Step 8: Build and push Spring Boot image
-# ============================================================================
-# Build the Spring Boot app container image and push it to GCR so the
-# cluster can pull it. Uses Docker Buildx for multi-arch if available.
-echo "==> Building Spring Boot image"
-cd "${REPO_ROOT}/spring-boot-app"
-docker build -t "${DOCKER_IMAGE}" .
-
-echo "==> Pushing Spring Boot image to GCR"
-docker push "${DOCKER_IMAGE}"
-
-# Validate image was pushed successfully
-if gcloud container images describe "${DOCKER_IMAGE}" --quiet >/dev/null 2>&1; then
-  echo "    ✓ Spring Boot image pushed to GCR"
-else
-  echo "    ERROR: Spring Boot image not found in GCR after push"
+if ! wait_jobs otel n8n camunda springboot; then
+  echo ""
+  echo "==> One or more Phase 2 jobs failed. See logs above."
   exit 1
 fi
-cd "${REPO_ROOT}"
-
-# ============================================================================
-# Step 9: Deploy Spring Boot App
-# ============================================================================
-# The Spring Boot app is our order service. It:
-# - Exposes REST API for creating orders
-# - Calls Camunda to start workflow instances
-# - Exports custom business metrics via Micrometer/OTel
-# - Uses OpenTelemetry Java agent for automatic instrumentation
-echo "==> Deploying Spring Boot App"
-kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/hello-observability-app.yaml"
-
-# Wait for Spring Boot app to be ready
-echo "==> Waiting for Spring Boot app to be ready..."
-kubectl rollout status deployment/hello-observability-app -n ${NS_APPS} --timeout=120s
-validate_pod_ready "${NS_APPS}" "app=hello-observability-app" "Spring Boot App"
-
-# Validate Spring Boot health endpoint
-validate_http_endpoint "http://$(kubectl get pod -n ${NS_APPS} -l app=hello-observability-app -o jsonpath='{.items[0].status.podIP}'):8080/actuator/health" "Spring Boot App" 15
 
 # ============================================================================
 # Final validation: Check OTel Collector is exporting
