@@ -1,6 +1,6 @@
 global:
   elasticsearch:
-    enabled: false
+    enabled: true
   identity:
     auth:
       enabled: false
@@ -44,5 +44,27 @@ connectors:
   # authenticate against.
   inbound:
     mode: disabled
+# Operate requires Elasticsearch as its data backend - its schema-migration
+# init container fails outright without it (ISSUE.md #2 addendum). Sized down
+# hard from the chart's 3-node default for a PoC: a single master node with
+# data.replicaCount left at 0 takes on the combined master+data role, which is
+# this chart's standard pattern for a minimal single-node cluster. Requires
+# the ComputeClass in k8s-infrastructure/elasticsearch-computeclass.yaml to
+# already exist - see that file for why (GKE Autopilot's vm.max_map_count
+# constraint).
 elasticsearch:
-  enabled: false
+  enabled: true
+  # Bitnami's chart also ships a legacy sysctl-fix initContainer that runs
+  # privileged: true / runAsUser: 0 to set vm.max_map_count itself - GKE
+  # Autopilot rejects privileged containers outright, so this would block
+  # pod admission entirely. The ComputeClass already sets the sysctl at the
+  # node level (the Autopilot-native mechanism), making this both redundant
+  # and actively harmful here.
+  sysctlImage:
+    enabled: false
+  master:
+    replicaCount: 1
+    nodeSelector:
+      cloud.google.com/compute-class: elasticsearch
+  data:
+    replicaCount: 0

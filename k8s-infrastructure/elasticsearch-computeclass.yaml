@@ -1,0 +1,27 @@
+# Camunda Operate requires Elasticsearch (its schema-migration init container fails
+# with Connection refused otherwise - see ISSUE.md #2 addendum). Elasticsearch needs
+# the host kernel's vm.max_map_count raised well above GKE's default, but Autopilot
+# forbids the usual privileged-initContainer/DaemonSet trick used on GKE Standard.
+# A custom ComputeClass is GKE Autopilot's supported mechanism for this: nodes
+# provisioned under this class get vm.max_map_count set at the node level, and pods
+# opt in via `nodeSelector: cloud.google.com/compute-class: elasticsearch` (a label
+# GKE applies automatically to nodes of this class - not something we set ourselves).
+#
+# 1048576 (not the older 262144) because this chart's bundled Elasticsearch image is
+# 8.18.0 - confirmed from charts/elasticsearch/values.yaml's `image.tag` in the
+# camunda-platform chart, per Elastic's own guidance for 8.16+.
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: elasticsearch
+spec:
+  autopilot:
+    enabled: true
+  nodePoolAutoCreation:
+    enabled: true
+  priorities:
+    - nodeSystemConfig:
+        linuxNodeConfig:
+          sysctls:
+            vm.max_map_count: 1048576
+  whenUnsatisfiable: DoNotScaleUp
