@@ -117,6 +117,11 @@ kubectl port-forward svc/camunda-poc-operate 8081:80 -n apps
 # open http://localhost:8081
 ```
 
+To watch an order run through the workflow: in Operate, go to **Processes** in the left nav,
+select **order-process**, then click into a running or completed instance from the list. That
+opens the BPMN diagram with the actual path the instance took highlighted live - trigger an order
+with `curl` in one window and watch it light up the diagram in Operate in the other.
+
 Then check [Cloud Trace](https://console.cloud.google.com/traces?project=hellootelworld) and
 [Cloud Monitoring](https://console.cloud.google.com/monitoring?project=hellootelworld) for the
 resulting telemetry.
