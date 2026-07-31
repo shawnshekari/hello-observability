@@ -46,15 +46,27 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
 # ============================================================================
 # Step 1: Uninstall Camunda 8 (Zeebe)
 # ============================================================================
-# Camunda 8 is deployed via Helm. We uninstall it first because other
-# services depend on it for workflow execution. The PVCs are deleted
-# separately to release the billed persistent disk (32Gi).
-echo "==> Uninstalling Camunda 8 (Zeebe)"
+# Camunda 8 (including Elasticsearch, which now lives in this same Helm
+# release - see ISSUE.md #2 addendum) is deployed via Helm. We uninstall it
+# first because other services depend on it for workflow execution. The
+# PVCs are deleted separately to release the billed persistent disk - this
+# now covers both Zeebe's (32Gi) and Elasticsearch's (64Gi) volumes, since
+# `--all` isn't scoped to a specific StatefulSet.
+echo "==> Uninstalling Camunda 8 (Zeebe + Elasticsearch)"
 helm uninstall camunda-poc -n ${NS_APPS} 2>/dev/null || echo "    (release not found, skipping)"
 
 # Delete PersistentVolumeClaims to free up disk space (billed resource!)
-echo "==> Deleting Zeebe PersistentVolumeClaims (this releases the billed persistent disk)"
+echo "==> Deleting Zeebe/Elasticsearch PersistentVolumeClaims (releases the billed persistent disk)"
 kubectl delete pvc --all -n ${NS_APPS} --ignore-not-found
+
+# The Elasticsearch ComputeClass is a scheduling policy object, not itself a
+# billed resource, so leaving it doesn't cost anything - but delete it
+# anyway for symmetry with up.sh (which re-applies it idempotently on the
+# next run regardless). The GKE node it caused to be provisioned gets
+# reclaimed automatically by the cluster autoscaler once nothing schedules
+# onto it anymore - no manual step needed for that part.
+echo "==> Deleting the Elasticsearch ComputeClass"
+kubectl delete -f "${REPO_ROOT}/k8s-infrastructure/elasticsearch-computeclass.yaml" --ignore-not-found
 
 # ============================================================================
 # Step 2: Delete n8n
