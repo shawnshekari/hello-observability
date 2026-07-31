@@ -178,6 +178,19 @@ older n8n version - the deployed instance is 2.32.6:
   returns `{"valid":true,"message":"Order validated successfully"}`; `quantity: 0` returns
   `{"valid":false,"message":"Order quantity must be at least 1"}` - both branches correct.
 
+**Addendum 5 (2026-07-30)**: with everything else working, Cloud Logging showed the OTel
+Collector logging a `Failed to scrape Prometheus endpoint` warning every 15s for
+`hello-observability-app.apps.svc.cluster.local:80` (HTTP 404). Root cause: `build.gradle.kts`
+never added `micrometer-registry-prometheus` - so `/actuator/prometheus` never existed on the app
+at all (confirmed: `GET /actuator` lists only `health`/`info`, regardless of `prometheus` being
+named in `management.endpoints.web.exposure.include`, since the exposure list can only reveal
+endpoints that already exist). Not a real gap, though - Spring Boot's metrics already reach Cloud
+Monitoring via the working `management.metrics.export.otlp` push path. Removed the redundant,
+always-broken scrape job from `otel-collector.yaml` and the now-misleading `prometheus` mention
+from `application.yml`'s exposure list, rather than adding a second collection path that was never
+needed. Confirmed live: collector restarted and its startup log now only registers the
+`camunda-zeebe`/`camunda-operate` scrape jobs.
+
 **Affected Components**:
 - `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
 - `spring-boot-app/src/main/resources/workflows/order-process.bpmn`

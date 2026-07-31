@@ -9,7 +9,12 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,prometheus
+        # No micrometer-registry-prometheus dependency, so /actuator/prometheus
+        # doesn't actually exist regardless of whether it's listed here - metrics
+        # go out via OTLP push below instead. Don't list "prometheus" here again
+        # without also adding that dependency (see otel-collector.yaml's comment
+        # on the scrape job that used to point at this, and always 404'd).
+        include: health,info
   metrics:
     export:
       otlp:

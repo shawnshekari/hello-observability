@@ -57,15 +57,15 @@ spec:
               static_configs:
                 - targets: ['camunda-poc-operate.apps.svc.cluster.local:9600']
 
-            # Spring Boot app metrics (custom business metrics). Scraped
-            # through the Service, so this must be the Service's port (80),
-            # not the container's targetPort (8080) - hitting 8080 directly
-            # against the Service's ClusterIP doesn't connect to anything.
-            - job_name: 'hello-observability-app'
-              scrape_interval: 15s
-              metrics_path: '/actuator/prometheus'
-              static_configs:
-                - targets: ['hello-observability-app.apps.svc.cluster.local:80']
+            # Spring Boot's own metrics are NOT scraped here - it pushes
+            # directly via OTLP instead (management.metrics.export.otlp in
+            # application.yml), which is already confirmed reaching Cloud
+            # Monitoring. A scrape job used to be defined here too, but
+            # build.gradle.kts never added micrometer-registry-prometheus,
+            # so /actuator/prometheus never actually existed on the app -
+            # every scrape attempt 404'd. Removed rather than adding the
+            # dependency, since OTLP push already covers these metrics and a
+            # second collection path would be redundant.
 
     exporters:
       googlecloud:
