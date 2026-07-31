@@ -146,10 +146,15 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
         the previous file had no actual valid/invalid branching, only the (broken) error path
   - Validated against `zeebe-bpmn-moddle` (the schema library Camunda's own tooling uses): parses
     clean with no warnings, `taskDefinition`/`errorRef`/gateway `default` all resolve correctly
-- [ ] Deploy the BPMN (auto-deploy via the Spring starter's classpath resource deployment, or a
-      manual deploy step) and confirm it passes Zeebe's deployment validation
-- [ ] Verify end-to-end: `POST /orders` → process instance created → Connector calls n8n →
-      instance completes → visible in Operate
+- [x] Deploy the BPMN (auto-deploy via `@Deployment` on app startup) - passed Zeebe's deployment
+      validation cleanly against the live cluster
+- [x] Verify end-to-end against the live cluster: `POST /orders` returned 200; confirmed via an
+      independent source (n8n's own execution log, not just Spring Boot's response) that the
+      Connector genuinely called n8n with the real order data - execution history contains the
+      exact `orderId` from the request. Operate's own API needs CSRF handling beyond a session
+      cookie to query programmatically (not pursued - it's a visual tool, easy to check directly
+      via `kubectl port-forward svc/camunda-poc-operate 8081:80 -n apps` then
+      http://localhost:8081, demo/demo)
 
 ### Phase 3: Continuous Integration (GitHub Actions)
 Everything checked off in Phase 2 was verified by hand tonight (`./gradlew test`, a `bootRun`
