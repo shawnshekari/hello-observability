@@ -1,6 +1,6 @@
-# Hello Observability: Pega to Composable Architecture PoC
+# Hello Observability: Composable Architecture PoC
 
-Proof of concept for migrating from a monolithic architecture (Pega) to a composable,
+Proof of concept for migrating from a monolithic architecture to a composable,
 cloud-native stack using **Camunda 8**, **n8n**, and **Spring Boot**, with unified observability
 via **OpenTelemetry**.
 
