@@ -98,11 +98,95 @@ locally rather than assuming:
   until the gateway's REST port is reachable, rather than relying on Kubernetes'
   crash-loop-backoff to eventually get there.
 
+**Addendum 3 (2026-07-30)**: the first real deployment against a live cluster (everything above
+was verified locally/statically, without a running cluster) surfaced a bug none of that could have
+caught: Camunda Operate's `migration` init container crash-looped with
+`java.net.ConnectException: Connection refused` against Elasticsearch. Root cause:
+`helm-values/camunda-values.yaml` had `operate.enabled: true` alongside
+`global.elasticsearch.enabled: false` / `elasticsearch.enabled: false` - but Operate's
+schema-migration step is a hard dependency on Elasticsearch, not an optional one. That combination
+can never work; `helm install --wait` would only ever time out after the full 10 minutes (confirmed
+- it did: `Error: context deadline exceeded`), no amount of waiting fixes it.
+
+Enabling Elasticsearch on GKE Autopilot has its own wrinkle: Elasticsearch needs the host kernel's
+`vm.max_map_count` raised well above GKE's default, and the chart's bundled Bitnami Elasticsearch
+subchart handles this via a `sysctlImage` init container that runs `privileged: true` /
+`runAsUser: 0` - which Autopilot's admission control rejects outright, unlike GKE Standard where
+this is the normal approach. Fixed with:
+- `k8s-infrastructure/elasticsearch-computeclass.yaml`: a GKE `ComputeClass`
+  (`cloud.google.com/v1`), the Autopilot-native mechanism for node-level kernel settings -
+  `vm.max_map_count: 1048576` (not the older `262144`; confirmed via the chart's own
+  `charts/elasticsearch/values.yaml` that the bundled image is `8.18.0`, and Elastic's own guidance
+  is 1048576 for 8.16+). Pods opt in via `nodeSelector: cloud.google.com/compute-class:
+  elasticsearch`, a label GKE applies automatically to nodes of that class.
+- `helm-values/camunda-values.yaml`: `sysctlImage.enabled: false` to disable the now-redundant
+  (and Autopilot-fatal) privileged init container, since the ComputeClass already handles it at the
+  node level.
+- Sized Elasticsearch down hard from the chart's default (`master.replicaCount: 3`) to a single
+  node (`master.replicaCount: 1`, `data.replicaCount: 0`, combined master+data role) - a 3-node ES
+  cluster plus a dedicated ComputeClass-provisioned node pool on top of everything else already
+  running would have been a real, avoidable cost increase for what's still just a PoC.
+
+Every field used above was checked against the live cluster's actual CRD schema via `kubectl
+explain computeclass...` (not assumed from documentation, which was sometimes ECK-operator-specific
+rather than applicable to this Helm-chart-based deployment) before writing the manifest, and the
+full change was verified with `helm template` (confirmed no privileged containers render) and
+`helm install --dry-run=server` (passed real validation) before touching the live cluster.
+
+**Addendum 4 (2026-07-30)**: with Camunda finally healthy, n8n turned out to have its own
+independent set of live-only bugs, all traceable to `n8n.yaml` pinning
+`docker.n8n.io/n8nio/n8n:latest` while `n8n/order-validation.json` was authored against a much
+older n8n version - the deployed instance is 2.32.6:
+- n8n now requires completing owner setup (`POST /rest/owner/setup`) and a session login
+  (`POST /rest/login`) before *any* API call succeeds - previously the workflow API was
+  unauthenticated. Every `/rest/` and even `/api/v1/` call returned 401 until this was done.
+- The Webhook node had no `responseMode` set, so it defaulted to `onReceived` - acknowledging the
+  HTTP request immediately (`{"message":"Workflow was started"}`) rather than waiting for the
+  workflow to finish and returning its actual output. Needed `responseMode: "lastNode"` +
+  `responseData: "firstEntryJson"`.
+- The "Valid Order"/"Invalid Order" Set nodes were declared `typeVersion: 1`, which n8n's source
+  (`packages/nodes-base/nodes/Set/Set.node.ts`) maps to `SetV1` - an implementation expecting a
+  completely different parameter shape (`values.boolean`/`values.string` arrays) than what the
+  file actually provided (`assignments.assignments`, the V2/V3 schema). `SetV1` found nothing to
+  set and silently passed its input through unchanged - the webhook returned 200 with no error,
+  just the wrong data, which is why this took inspecting n8n's own source to diagnose rather than
+  reading an error message. Bumped to `typeVersion: 3.4` (mapped to `SetV2`, which the file's
+  existing parameter shape already matches - no restructuring needed, just the version number).
+- Even after that fix, "Check Quantity" always took the false branch regardless of input. Its
+  condition read `={{ $json.quantity }}`, but the Webhook node nests the actual request payload
+  under `.body` (confirmed from the node's own raw output shape) - so `value1` was always
+  `undefined`, and `largerEqual`'s `(value1 || 0) >= (value2 || 0)` always evaluated `0 >= 1` =
+  false. Fixed to `$json.body.quantity`. This one wasn't a version-drift issue like the others -
+  just a pre-existing authoring bug in the original workflow that happened to never surface until
+  the workflow could actually execute for the first time tonight.
+- Also found (not the active bug, but real): both Set nodes had a duplicate `parameters` JSON key
+  - a dead `{"responseMode":"responseJson","options":{}}` block that JSON parsing silently
+  discards in favor of the second occurrence. Removed.
+- `up.sh`'s import/activation logic was independently broken on top of all of the above: busybox
+  wget (the n8n image has no curl/jq) has no `--method` flag whatsoever, so the old
+  `--method=PUT .../activate` call could never have succeeded even against a compatible n8n
+  version - confirmed by testing it directly (`wget: unrecognized option: method=PUT`). And piping
+  the workflow JSON through `echo '...' | wget --post-data=@-` across multiple layers of shell
+  quoting (this script -> `kubectl exec` -> remote `sh` -> `echo`) corrupted the JSON body
+  (`ResponseError: Failed to parse request body` in n8n's own logs) even once auth was fixed.
+  Replaced entirely: `scripts/n8n-import-workflow.js` (new, committed) is `kubectl cp`'d into the
+  pod alongside the workflow JSON and run with the pod's own Node.js (`node --version` confirmed
+  v24, has built-in `fetch` - no method restrictions, no shell-quoting layers to fight). Handles
+  owner setup, login, idempotent replacement of any existing same-named workflow, import, and
+  activation, all via real HTTP calls instead of shell-escaped one-liners.
+- Verified live end-to-end after all fixes: `POST /webhook/order-validation` with `quantity: 2`
+  returns `{"valid":true,"message":"Order validated successfully"}`; `quantity: 0` returns
+  `{"valid":false,"message":"Order quantity must be at least 1"}` - both branches correct.
+
 **Affected Components**:
 - `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
 - `spring-boot-app/src/main/resources/workflows/order-process.bpmn`
 - `spring-boot-app/build.gradle.kts`
 - `helm-values/camunda-values.yaml`
+- `k8s-infrastructure/elasticsearch-computeclass.yaml`
+- `n8n/order-validation.json`
+- `scripts/n8n-import-workflow.js`
+- `scripts/up.sh`
 
 ---
 

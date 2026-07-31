@@ -79,6 +79,14 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
       chart; the actual actuator/management port is `9600`)
 - [ ] Fix the n8n webhook URL namespace in the BPMN file (folded into the Phase 2 rewrite below,
       since that file needs a structural rewrite regardless)
+- [ ] Set explicit CPU requests on containers currently relying on GKE Autopilot's
+      `autopilot-default-resources-mutator` - observed live during the first real `up.sh` run: n8n,
+      Spring Boot, and all three cert-manager Deployments (cert-manager, cert-manager-webhook,
+      cert-manager-cainjector) had their CPU request silently defaulted rather than declared.
+      Relying on the mutator means what's actually scheduled/billed doesn't match what's written
+      down anywhere - `n8n.yaml`/`hello-observability-app.yaml` are ours to edit directly; the
+      cert-manager ones come from the jetstack chart and need `--set` overrides (or a values file)
+      added to `up.sh`'s `helm upgrade --install cert-manager` call
 
 ### Phase 1: Spring Boot App
 - [x] Scaffold Spring Boot app in `spring-boot-app/`
@@ -167,11 +175,54 @@ a live cluster. Worth doing now, before Phases 4-6 add more surface area to regr
 ### Phase 4: n8n Workflow
 - [x] Create webhook workflow for order validation
 - [x] Deploy to n8n (automated in `up.sh`)
+- [x] Fix the workflow import/activation automation and the workflow itself - the first real
+      deployment surfaced four real, stacked bugs, all traceable to `n8n.yaml` pinning
+      `docker.n8n.io/n8nio/n8n:latest` while the workflow JSON was authored against a much older
+      n8n version (now running 2.32.6). None were findable without a live n8n instance - see
+      `ISSUE.md` #2 addendum:
+  - n8n now requires completing owner setup + session login before any API call succeeds at all
+    (previously unauthenticated) - `scripts/n8n-import-workflow.js` handles this now
+  - The Webhook node needed `responseMode: "lastNode"` + `responseData: "firstEntryJson"` - it was
+    acknowledging requests immediately (`{"message":"Workflow was started"}`) instead of waiting
+    for the workflow to finish and returning its actual output
+  - The "Valid Order"/"Invalid Order" Set nodes were pinned to `typeVersion: 1`, which expects an
+    entirely different parameter schema (`values.boolean`/`values.string`) than what the file
+    actually provided (`assignments.assignments`, the V2/V3 schema) - so they silently passed
+    input through unchanged. Bumped to `typeVersion: 3.4`, which matches the schema already in use
+  - The "Check Quantity" IF node's condition read `$json.quantity`, but n8n's Webhook node nests
+    the actual request payload under `.body` - so the condition always evaluated false regardless
+    of the real quantity. Fixed to `$json.body.quantity`
+  - Also removed a duplicate `parameters` key on both Set nodes (dead JSON - the second occurrence
+    silently wins during parsing, so it wasn't the active bug, but it was confusing and untracked)
+  - `up.sh`'s import step itself was also broken independent of all of the above: busybox wget (no
+    curl/jq in this image) has no `--method` flag at all, so its `--method=PUT .../activate` call
+    could never have worked even on an older n8n; and piping the workflow JSON through
+    `echo '...' | wget --post-data=@-` across several layers of shell quoting corrupted the body.
+    Replaced with `kubectl cp`-ing real files into the pod and running a committed Node script
+    (`scripts/n8n-import-workflow.js`, using Node's built-in `fetch` - no method restrictions, no
+    shell-quoting layers to fight)
+  - Verified live end-to-end: `POST /webhook/order-validation` with `quantity: 2` returns
+    `{"valid":true,"message":"Order validated successfully"}`; `quantity: 0` returns
+    `{"valid":false,...}` - both branches correct
 - [ ] Add configurable delay (simulated API call) - stretch goal, not blocking
 - [ ] Add error injection for testing - stretch goal, not blocking
 
 ### Phase 5: Camunda Operate
 - [x] Enable Camunda Operate in `helm-values/camunda-values.yaml`
+- [x] Enable Elasticsearch as Operate's data backend. Discovered live during the first real
+      deployment (not something static analysis could have caught): Operate's schema-migration
+      init container fails outright with `Connection refused` when Elasticsearch is disabled -
+      `operate.enabled: true` + `elasticsearch.enabled: false` is not a valid combination, Operate
+      cannot start at all without it (see `ISSUE.md` #2 addendum). Sized down hard from the
+      chart's 3-node default to a single node for a PoC (`master.replicaCount: 1`,
+      `data.replicaCount: 0`, combined master+data role). GKE Autopilot forbids the
+      privileged-initContainer trick charts normally use to set `vm.max_map_count`, so added
+      `k8s-infrastructure/elasticsearch-computeclass.yaml` (a GKE `ComputeClass`, the
+      Autopilot-native mechanism for node-level kernel settings) and disabled the chart's
+      redundant/now-harmful `sysctlImage` init container, which runs `privileged: true` and would
+      otherwise fail Autopilot admission outright. Verified via `helm template` (renders with no
+      privileged containers) and `helm install --dry-run=server` (passes real admission-adjacent
+      validation) before applying to the live cluster.
 - [ ] Port-forward and verify workflow instances are visible (blocked on Phase 2)
 - [ ] Use Operate to inspect trace context propagation through the Connector call (needs
       verification - it's not guaranteed the Connector Runtime propagates the Zeebe job's trace
@@ -214,6 +265,55 @@ investigation. Once 8.10 is out:
       template` against the real chart, `zeebe-bpmn-moddle` schema validation on the BPMN, and a
       local `./gradlew bootRun` smoke test - all three caught real bugs during the 8.8.0 work that
       would otherwise have only surfaced live on the cluster
+
+### Phase 9: Local Docker Compose environment (future research, not scheduled)
+Raised 2026-07-30: the workstation this project is developed on is well beyond what this PoC
+needs (128GB RAM, 16-thread Ryzen 7 5800X3D, 12TB disk), which opens up local-only iteration as a
+real alternative to a live GKE cluster for day-to-day development - zero GCP cost while iterating,
+only spinning up the real cluster occasionally for cloud-specific validation (Cloud Trace/Monitoring
+export, GKE Autopilot behavior itself).
+
+This isn't just easier logistically - it sidesteps entire categories of problems this session hit
+that are specific to GKE Autopilot and don't exist on plain Docker:
+- No Autopilot admission restrictions - privileged containers (e.g. Elasticsearch's normal
+  `vm.max_map_count` init container, disabled in Phase 5 because Autopilot rejects it) just work,
+  no `ComputeClass` workaround needed.
+- No cert-manager / OTel Operator machinery - both exist solely to manage the OTel Collector's
+  lifecycle and TLS certs declaratively in Kubernetes; a local Collector just needs a static YAML
+  config file.
+- No per-pod Autopilot resource minimums or cold-start node-provisioning delays (this session's
+  n8n/Spring Boot rollout-status timeouts were real GKE node-autoscaling lag, not app slowness).
+- `vm.max_map_count` becomes a one-line `sudo sysctl -w vm.max_map_count=1048576` on the host
+  instead of a GKE-specific `ComputeClass` detour, since Docker containers share the host kernel
+  directly.
+
+Confirmed (not assumed) that Camunda officially maintains a docker-compose distribution of the
+full 8.x stack (Zeebe, Operate, Connectors, Elasticsearch) at
+[`camunda/camunda-distributions`](https://github.com/camunda/camunda-distributions/tree/main/docker-compose),
+explicitly intended for local dev use. Our pinned version (chart 11.12.3 / Camunda 8.6.x) predates
+Camunda 8.10's later change to unbundle Elasticsearch from that distribution, so it should still
+include everything we need.
+
+What adapting it to this project would actually involve:
+- [ ] Layer n8n, the Spring Boot app (existing `Dockerfile` already works), and a static OTel
+      Collector config on top of Camunda's official compose file
+- [ ] Swap the handful of Kubernetes-internal DNS names our code currently hardcodes
+      (`n8n-service.apps.svc.cluster.local`, `camunda-poc-zeebe-gateway.apps.svc.cluster.local`,
+      etc. - in `order-process.bpmn` and `application.yml`) for Docker Compose service names.
+      `application.yml`'s Zeebe address is already env-var-overridable
+      (`CAMUNDA_CLIENT_GRPC_ADDRESS`); the BPMN's n8n URL is currently a hardcoded literal and
+      would need to become configurable too (e.g. a FEEL expression reading a process variable, or
+      a separate local-dev copy of the BPMN)
+- [ ] Sort out GCP credentials for telemetry export from outside GKE - no Workload Identity
+      available locally, so the Collector would need a downloaded service account key file mounted
+      in instead (or just skip GCP export for pure local dev and use a console/debug exporter,
+      saving the cloud round-trip entirely for fast iteration)
+- [ ] One-time host setup: `sudo sysctl -w vm.max_map_count=1048576` (or persist via
+      `/etc/sysctl.conf`) so Elasticsearch's container can start without any Kubernetes-specific
+      workaround
+
+Estimated as bounded, well-understood work (roughly an hour or two) rather than a redesign, given
+the official Camunda compose distribution already does the hard part.
 
 ## Environment
 - GCP project: `hellootelworld`
