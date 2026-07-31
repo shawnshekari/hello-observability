@@ -66,7 +66,7 @@
 
     <!-- Business decision on n8n's response - not an error, a normal
          branch. default="Flow_Invalid" makes rejection the fallback path
-         if validationResult.valid is ever missing/null rather than the
+         if the "valid" variable is ever missing/null rather than the
          process silently stalling. -->
     <bpmn:exclusiveGateway id="Gateway_OrderValid" name="Order Valid?" default="Flow_Invalid">
       <bpmn:incoming>Flow_2</bpmn:incoming>
@@ -75,7 +75,16 @@
     </bpmn:exclusiveGateway>
 
     <bpmn:sequenceFlow id="Flow_Valid" sourceRef="Gateway_OrderValid" targetRef="CompleteOrder">
-      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=validationResult.valid</bpmn:conditionExpression>
+      <!-- "valid", not "validationResult.valid": resultExpression's mapped
+           output lands as its own top-level process variable, separate from
+           whatever resultVariable stores (confirmed in
+           ConnectorResultHandler.createOutputVariables - resultVariable's
+           raw response and resultExpression's mapped keys both get put into
+           the same output-variables map, they don't nest). validationResult
+           itself still holds the raw response object (status/headers/body/
+           reason), kept for observability in Operate when troubleshooting -
+           see ISSUE.md #2 addendum for the incident this produced live. -->
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=valid</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
 
     <bpmn:sequenceFlow id="Flow_Invalid" sourceRef="Gateway_OrderValid" targetRef="OrderRejected" />

@@ -191,6 +191,42 @@ from `application.yml`'s exposure list, rather than adding a second collection p
 needed. Confirmed live: collector restarted and its startup log now only registers the
 `camunda-zeebe`/`camunda-operate` scrape jobs.
 
+**Addendum 6 (2026-07-30)**: despite the "verified live end-to-end" claim above, real orders
+posted through the app started producing Zeebe **incidents** on `Gateway_OrderValid`, visible in
+Operate as a red badge on the `ValidateOrder`/boundary-event area. Root cause traced with the
+authoritative source data, not guessed: since Operate's own REST API needs CSRF handling beyond a
+simple session cookie (its login response sets a `X-CSRF-TOKEN` *response header*, distinct from a
+same-named cookie it also sets - the frontend reads the header value and echoes it back on
+subsequent requests; this wasn't discovered in time to be worth pursuing further), the incident
+document was read directly from the `operate-incident-*` Elasticsearch index Operate itself is
+backed by:
+
+```
+errorType: EXTRACT_VALUE_ERROR
+errorMessage: Expected result of the expression 'validationResult.valid' to be 'BOOLEAN', but was
+  'NULL'. ... No context entry found with key 'valid'. Available keys: 'status', 'headers',
+  'body', 'reason'
+```
+
+The BPMN's `Gateway_OrderValid` condition read `validationResult.valid`, on the (wrong)
+assumption that `resultExpression`'s mapped output would nest inside the `resultVariable`-named
+variable. Traced into `ConnectorResultHandler.createOutputVariables` in the `camunda/connectors`
+repo: `resultVariable` and `resultExpression` are independent - `resultVariable` stores the raw
+response object under its own name (exactly the `status`/`headers`/`body`/`reason` shape seen in
+the error), while `resultExpression`'s mapped keys (`valid`, `message`) are `putAll`'d as their
+own **top-level** process variables, not nested under `resultVariable`'s name. Fixed the condition
+to just `=valid`. Kept `resultVariable` (the raw response is genuinely useful to have visible in
+Operate when troubleshooting exactly this kind of thing - which is exactly what happened here).
+
+Since the BPMN is bundled into the Spring Boot image at build time (`@Deployment` loads it from
+the classpath), fixing the source file alone doesn't change what's running - rebuilt and pushed
+the image, then deleted the pod to force a fresh pull. The new deployment logged
+`Deployed: <order-process:2>` (Zeebe versioned it automatically). Verified via the same
+Elasticsearch-direct approach: a fresh order's `operate-flownode-instance` records show
+`StartEvent_1 -> ValidateOrder -> Gateway_OrderValid -> CompleteOrder`, all `COMPLETED`, no new
+incident - confirming the full chain now genuinely completes, not just "the HTTP calls succeeded"
+as the earlier addendum had actually verified.
+
 **Affected Components**:
 - `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
 - `spring-boot-app/src/main/resources/workflows/order-process.bpmn`

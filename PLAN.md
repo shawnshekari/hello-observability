@@ -148,13 +148,21 @@ of "artifact exists" items checked that were never actually wired end-to-end. Sp
     clean with no warnings, `taskDefinition`/`errorRef`/gateway `default` all resolve correctly
 - [x] Deploy the BPMN (auto-deploy via `@Deployment` on app startup) - passed Zeebe's deployment
       validation cleanly against the live cluster
-- [x] Verify end-to-end against the live cluster: `POST /orders` returned 200; confirmed via an
-      independent source (n8n's own execution log, not just Spring Boot's response) that the
-      Connector genuinely called n8n with the real order data - execution history contains the
-      exact `orderId` from the request. Operate's own API needs CSRF handling beyond a session
-      cookie to query programmatically (not pursued - it's a visual tool, easy to check directly
-      via `kubectl port-forward svc/camunda-poc-operate 8081:80 -n apps` then
-      http://localhost:8081, demo/demo)
+- [x] Verify end-to-end against the live cluster - this took two passes. The first pass confirmed
+      `POST /orders` returned 200 and that the Connector genuinely called n8n (n8n's execution log
+      contained the real `orderId`), but that turned out to be incomplete: real orders were
+      actually landing as **incidents** on `Gateway_OrderValid` (spotted live in Operate, not
+      caught by the first pass's checks). Root cause and fix in `ISSUE.md` #2 addendum 6 - the
+      gateway's condition referenced `validationResult.valid`, but `resultExpression`'s mapped
+      output lands as independent top-level variables, not nested under `resultVariable`'s name;
+      fixed to `=valid`. Rebuilt/redeployed (BPMN is bundled into the image at build time, editing
+      the source alone doesn't change what's running), then verified for real this time by reading
+      the process instance's flow-node history directly from Elasticsearch:
+      `StartEvent_1 -> ValidateOrder -> Gateway_OrderValid -> CompleteOrder`, all `COMPLETED`, no
+      incident. Operate's own API needs CSRF handling beyond a session cookie to query
+      programmatically (worked out how - login response sets an `X-CSRF-TOKEN` header, echo it
+      back on subsequent requests - but querying Elasticsearch directly was faster once discovered
+      and is the same authoritative data Operate itself reads from)
 
 ### Phase 3: Continuous Integration (GitHub Actions)
 Everything checked off in Phase 2 was verified by hand tonight (`./gradlew test`, a `bootRun`
