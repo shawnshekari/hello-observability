@@ -76,6 +76,15 @@ spec:
         traces:
           receivers: [otlp]
           exporters: [googlecloud]
+        # Both prometheus (Zeebe/Operate, pull-based) and otlp (Spring Boot's
+        # own business metrics via Micrometer, push-based) feed this one
+        # pipeline. Before this, only prometheus was listed here - the otlp
+        # receiver was wired into the traces pipeline but not this one, so
+        # even a correctly-configured OTLP metrics push had no pipeline route
+        # to follow and got a plain HTTP 404 from the collector (it doesn't
+        # bind /v1/metrics at all unless some pipeline actually consumes
+        # otlp-sourced metrics). See ISSUE.md #2 addendum for the full
+        # diagnosis chain that led here.
         metrics:
-          receivers: [prometheus]
+          receivers: [prometheus, otlp]
           exporters: [googlecloud]

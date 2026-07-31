@@ -14,15 +14,34 @@ management:
         # go out via OTLP push below instead. Don't list "prometheus" here again
         # without also adding that dependency (see otel-collector.yaml's comment
         # on the scrape job that used to point at this, and always 404'd).
-        include: health,info
-  metrics:
-    export:
-      otlp:
-        enabled: true
-        naming:
-          convention: full
-        properties:
-          otel.service.name: ${spring.application.name}
+        # "metrics" is a core actuator endpoint (no extra dependency needed) -
+        # useful for checking what's actually registered locally
+        # (/actuator/metrics/orders.created) without waiting on the OTLP
+        # export pipeline, which is exactly what diagnosed the missing
+        # orders.* metrics in Cloud Monitoring - see ISSUE.md #2 addendum.
+        include: health,info,metrics
+  # The property prefix for Micrometer's OTLP metrics export is
+  # "management.otlp.metrics.export" - confirmed directly against Spring
+  # Boot 3.2.4's own OtlpProperties.java source
+  # (@ConfigurationProperties(prefix = "management.otlp.metrics.export")).
+  # This was previously (wrongly) nested under "management.metrics.export.otlp"
+  # instead, which Spring's relaxed binding just silently ignores rather than
+  # erroring on - so it always fell back to OtlpProperties' hardcoded default
+  # of http://localhost:4318/v1/metrics, which nothing listens on in this pod.
+  # Confirmed via live logs: java.net.ConnectException: Connection refused,
+  # every ~60s, since the very first deployment. This is a completely
+  # separate config path from the OTel Java agent's OTEL_EXPORTER_OTLP_ENDPOINT
+  # env var (which only the agent's own auto-instrumentation reads) - that's
+  # why jvm_*/http_server_requests_* metrics attributed to *other* services
+  # (e.g. Camunda Operate, via Prometheus scrape) were visible in Cloud
+  # Monitoring the whole time, creating a false impression this path worked.
+  # (There's no "naming.convention" or "properties" field on OtlpProperties
+  # at all - both silently ignored too; removed rather than left as dead
+  # config. See ISSUE.md #2 addendum for the full diagnosis.)
+  otlp:
+    metrics:
+      export:
+        url: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://cluster-collector-collector.observability.svc.cluster.local:4318}/v1/metrics
 
 # Verified against io.camunda:camunda-spring-boot-starter:8.8.0 directly
 # (CamundaClientProperties.java / modes/self-managed.yaml in the camunda/camunda

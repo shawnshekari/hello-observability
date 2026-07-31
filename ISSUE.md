@@ -227,12 +227,51 @@ Elasticsearch-direct approach: a fresh order's `operate-flownode-instance` recor
 incident - confirming the full chain now genuinely completes, not just "the HTTP calls succeeded"
 as the earlier addendum had actually verified.
 
+**Addendum 7 (2026-07-30)**: asked to set up a Cloud Monitoring metric for the order process,
+which surfaced that `orders.created`/`orders.failed`/`orders.latency` (the app's own business
+metrics from `OrderService`) had **never once** reached Cloud Monitoring, going all the way back to
+the very first deployment - two independent, stacked bugs, both found by reading actual source
+rather than guessing:
+
+1. `application.yml` configured Micrometer's OTLP metrics export under
+   `management.metrics.export.otlp.*`. Confirmed directly against Spring Boot 3.2.4's own
+   `OtlpProperties.java`: the real prefix is `management.otlp.metrics.export.*` (metrics/export and
+   otlp are in the opposite order). Spring's relaxed binding doesn't error on unrecognized nested
+   keys, so this was silently ignored the entire time, and Micrometer kept using
+   `OtlpProperties`'s hardcoded default (`http://localhost:4318/v1/metrics`, unreachable in this
+   pod) - confirmed via live logs: `java.net.ConnectException: Connection refused`, every ~60s,
+   since the first deployment. (`naming.convention` and `properties.otel.service.name`, also under
+   the wrong prefix, don't correspond to any field on `OtlpProperties` at all - removed rather than
+   left as dead config once the block was rewritten.) This is a completely separate config path
+   from the OTel Java agent's `OTEL_EXPORTER_OTLP_ENDPOINT` env var, which only the agent's own
+   auto-instrumentation reads - the `jvm_*`/`http_server_requests_*`/etc. metrics that *did* appear
+   in Cloud Monitoring the whole time turned out to be attributed to `service_name: camunda-operate`
+   (Operate is also a Spring Boot app internally, scraped via Prometheus), not our app at all - a
+   false positive that delayed catching this.
+2. Fixing #1 traded `Connection refused` for `HTTP 404` from the collector itself. Root cause in
+   `otel-collector.yaml`: the `metrics` pipeline listed `receivers: [prometheus]` only - the `otlp`
+   receiver was wired into the `traces` pipeline but never the `metrics` one, so the collector had
+   no route for OTLP-sourced metrics and didn't even bind `/v1/metrics` for that purpose. This is
+   also why traces already worked (n8n's, confirmed visible in Cloud Trace earlier) while OTLP
+   metrics never had anywhere to go. Fixed by adding `otlp` to the metrics pipeline's receivers
+   alongside the existing `prometheus` one.
+
+Diagnostic approach worth noting: `/actuator/metrics` (a core actuator endpoint, no extra
+dependency) confirmed the counters were correctly registered and incrementing *locally*
+(`orders.created` 0 -> 1 after a real order) before either fix, which ruled out `OrderService`
+itself and correctly pointed at the export path as the only remaining suspect.
+
+Verified live after both fixes: `workload.googleapis.com/orders.created` and
+`workload.googleapis.com/orders.failed` now exist as real metric descriptors in Cloud Monitoring.
+
 **Affected Components**:
 - `spring-boot-app/src/main/java/com/helloobservability/OrderService.java`
 - `spring-boot-app/src/main/resources/workflows/order-process.bpmn`
+- `spring-boot-app/src/main/resources/application.yml`
 - `spring-boot-app/build.gradle.kts`
 - `helm-values/camunda-values.yaml`
 - `k8s-infrastructure/elasticsearch-computeclass.yaml`
+- `k8s-infrastructure/otel-collector.yaml`
 - `n8n/order-validation.json`
 - `scripts/n8n-import-workflow.js`
 - `scripts/up.sh`

@@ -243,11 +243,25 @@ a live cluster. Worth doing now, before Phases 4-6 add more surface area to regr
       Phase 2 is live before assuming it's continuous)
 
 ### Phase 6: OTel Metrics
-- [x] Export custom metrics from Spring Boot
-- [x] Export workflow metrics from Camunda (scrape target now fixed - needs live verification)
-- [x] Export processing metrics from n8n
-- [ ] Verify metrics actually flow to Google Cloud Monitoring (live verification once Phase 0/2
-      are deployed and generating traffic)
+- [x] Export workflow metrics from Camunda - confirmed live, real Zeebe/Operate metric descriptors
+      exist in Cloud Monitoring
+- [x] Export processing metrics from n8n - confirmed live, n8n's own traces visible in Cloud Trace
+- [x] Export custom metrics from Spring Boot and verify they actually flow to Google Cloud
+      Monitoring - this had **never worked**, going back to the first deployment, on two
+      independent stacked bugs (full root cause in `ISSUE.md` #2 addendum 7):
+  1. `application.yml` had Micrometer's OTLP export properties under the wrong prefix
+     (`management.metrics.export.otlp.*` instead of the real `management.otlp.metrics.export.*`,
+     confirmed against Spring Boot 3.2.4's own source) - silently ignored rather than erroring, so
+     it kept defaulting to an unreachable `localhost:4318`
+  2. Once that was fixed, `otel-collector.yaml`'s `metrics` pipeline turned out to only list
+     `prometheus` as a receiver - the `otlp` receiver was wired into `traces` but never `metrics`,
+     so the collector had no route for it and returned a plain 404
+  - `jvm_*`/`http_server_requests_*` metrics that appeared in Cloud Monitoring the whole time were
+    a false positive - they're attributed to `service_name: camunda-operate` (also a Spring Boot
+    app internally, reached via Prometheus scrape), not our app, which is what let this go
+    unnoticed for so long
+  - Verified live: `workload.googleapis.com/orders.created` and `.../orders.failed` now exist as
+    real metric descriptors in Cloud Monitoring
 
 ### Phase 7: Google Cloud Dashboards
 - [ ] Create dashboard with golden signals
