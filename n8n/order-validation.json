@@ -5,6 +5,8 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "order-validation",
+        "responseMode": "lastNode",
+        "responseData": "firstEntryJson",
         "options": {}
       },
       "name": "Webhook",
@@ -18,7 +20,7 @@
         "conditions": {
           "number": [
             {
-              "value1": "={{ $json.quantity }}",
+              "value1": "={{ $json.body.quantity }}",
               "operation": "largerEqual",
               "value2": "1"
             }
@@ -31,14 +33,6 @@
       "position": [450, 300]
     },
     {
-      "parameters": {
-        "responseMode": "responseJson",
-        "options": {}
-      },
-      "name": "Valid Order",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 1,
-      "position": [650, 200],
       "parameters": {
         "assignments": {
           "assignments": [
@@ -56,17 +50,13 @@
             }
           ]
         }
-      }
+      },
+      "name": "Valid Order",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [650, 200]
     },
     {
-      "parameters": {
-        "responseMode": "responseJson",
-        "options": {}
-      },
-      "name": "Invalid Order",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 1,
-      "position": [650, 400],
       "parameters": {
         "assignments": {
           "assignments": [
@@ -84,7 +74,11 @@
             }
           ]
         }
-      }
+      },
+      "name": "Invalid Order",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [650, 400]
     }
   ],
   "connections": {

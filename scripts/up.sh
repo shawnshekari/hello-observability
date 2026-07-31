@@ -63,6 +63,14 @@ NS_APPS="apps"
 # Image configuration for Spring Boot app
 DOCKER_IMAGE="gcr.io/${PROJECT_ID}/hello-observability-app"
 
+# n8n requires an owner account before its API accepts any request at all
+# (see ISSUE.md #2 addendum) - this PoC creates one non-interactively via
+# n8n-import-workflow.js. Not a real secret: n8n has no external exposure
+# (ClusterIP only), so this is just a fixed local credential, not something
+# that needs GCP Secret Manager treatment for this PoC's threat model.
+N8N_OWNER_EMAIL="admin@hello-observability.local"
+N8N_OWNER_PASSWORD="HelloObservability2026!"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ============================================================================
@@ -293,24 +301,21 @@ job_n8n_deploy() {
   kubectl rollout status deployment/n8n -n ${NS_APPS} --timeout=120s
   validate_pod_ready "${NS_APPS}" "app=n8n" "n8n"
 
-  # Import n8n workflow. The n8n image is Alpine-based without curl or jq,
-  # so we exec in and use wget + grep instead. The workflow JSON is
-  # interpolated inside single quotes below, so it must never contain a
-  # literal single-quote character (order-validation.json doesn't today).
+  # Import n8n workflow. Earlier versions of this step used wget+grep piped
+  # through several layers of shell quoting, which turned out to be broken
+  # in multiple ways (busybox wget has no --method flag at all, so it could
+  # never have PATCH/PUT'd the activation call; multi-layer shell escaping
+  # mangled the JSON body). Copying real files into the pod and running a
+  # committed Node script sidesteps both problems entirely - see
+  # n8n-import-workflow.js and ISSUE.md #2 addendum for the full history
+  # (n8n's :latest tag also turned out to require an owner account before
+  # any API call works at all, which the script also handles).
   echo "==> Importing n8n order validation workflow"
   N8N_POD=$(kubectl get pods -n ${NS_APPS} -l app=n8n -o jsonpath='{.items[0].metadata.name}')
-  N8N_WORKFLOW=$(cat "${REPO_ROOT}/n8n/order-validation.json")
-  kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "echo '${N8N_WORKFLOW}' | wget -qO- --post-data=@- --header='Content-Type: application/json' http://localhost:5678/api/v1/workflows -O /dev/null"
-
-  # Activate the workflow. n8n's Alpine image only has busybox grep/sed, no
-  # jq, so we extract the id with a regex instead of proper JSON parsing.
-  # (Note: a prior version of this line ended with `grep -o '[^"]*$'`, which
-  # can only ever match an empty string here since the string it's applied
-  # to ends in a `"` - that silently produced an empty WORKFLOW_ID. Using
-  # sed's backreference instead.)
-  WORKFLOW_ID=$(kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c 'wget -qO- http://localhost:5678/api/v1/workflows | grep -o "\"id\":\"[^\"]*\",\"name\":\"Order Validation\"" | sed -r "s/\"id\":\"([^\"]*)\".*/\1/"')
-  kubectl exec "${N8N_POD}" -n ${NS_APPS} -- sh -c "wget -qO- --method=PUT http://localhost:5678/api/v1/workflows/${WORKFLOW_ID}/activate"
-  echo "    ✓ n8n workflow imported and activated (id: ${WORKFLOW_ID})"
+  kubectl cp "${REPO_ROOT}/n8n/order-validation.json" "${NS_APPS}/${N8N_POD}:/tmp/order-validation.json"
+  kubectl cp "${REPO_ROOT}/scripts/n8n-import-workflow.js" "${NS_APPS}/${N8N_POD}:/tmp/n8n-import-workflow.js"
+  kubectl exec "${N8N_POD}" -n ${NS_APPS} -- node /tmp/n8n-import-workflow.js \
+    /tmp/order-validation.json "${N8N_OWNER_EMAIL}" "${N8N_OWNER_PASSWORD}"
 }
 
 job_camunda_deploy() {
@@ -320,7 +325,16 @@ job_camunda_deploy() {
   # - Exports metrics to OTel Collector (scraped via Prometheus)
   #
   # We use Helm chart 11.12.3 (Camunda 8.6.x) to avoid kernel issues on
-  # Autopilot. Only Zeebe + Gateway + Operate are deployed (no Elasticsearch).
+  # Autopilot. Operate requires Elasticsearch as its data backend (its
+  # schema-migration init container fails outright without it - see
+  # ISSUE.md #2 addendum), so a single-node Elasticsearch is enabled via
+  # camunda-values.yaml. That requires this ComputeClass to already exist -
+  # see k8s-infrastructure/elasticsearch-computeclass.yaml for why (GKE
+  # Autopilot's vm.max_map_count constraint). ComputeClass is cluster-scoped
+  # (not namespaced), so applying it is idempotent regardless of run order.
+  echo "==> Applying Elasticsearch ComputeClass"
+  kubectl apply -f "${REPO_ROOT}/k8s-infrastructure/elasticsearch-computeclass.yaml"
+
   # This only needs the 'apps' namespace, not n8n/OTel to be ready.
   echo "==> Deploying Camunda 8 (Zeebe)"
   helm upgrade --install camunda-poc camunda/camunda-platform \
